@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sentinel-mcp"
+version = "0.1.0"
+description = "Context-aware AI agent for automated web application security analysis and verified remediation"
+requires-python = ">=3.11"
+dependencies = [
+    # MCP server — pin minor, allow patch updates
+    "mcp[cli]>=1.9.0,<3.0",
+    # Data validation — pin major
+    "pydantic>=2.11.0,<3.0",
+    # Context graph
+    "networkx>=3.3,<4.0",
+    # Tree-sitter (C extension — see docs/research/setup-windows.md for MSVC requirement)
+    "tree-sitter>=0.23.0,<1.0",
+    "tree-sitter-javascript>=0.23.0,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+sentinel = "sentinel.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sentinel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+src = ["src"]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "S", "B"]
+ignore = [
+    "S603",  # subprocess calls are intentional (scanner invocation)
+    "S607",  # partial path for subprocess — controlled by our code
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true

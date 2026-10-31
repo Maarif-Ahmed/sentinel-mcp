@@ -39,11 +39,10 @@ class RouteInfo:
 # Lazy import — tree-sitter may not build on all Windows configurations.
 # If import fails, _TREESITTER_AVAILABLE is False and we use the regex fallback.
 _TREESITTER_AVAILABLE = False
-_ts_language = None
 
 try:
     import tree_sitter_javascript as tsjs
-    from tree_sitter import Language, Parser
+    from tree_sitter import Language, Parser, Query, QueryCursor
 
     _JS_LANGUAGE = Language(tsjs.language())
     _ts_parser = Parser(_JS_LANGUAGE)
@@ -54,18 +53,15 @@ except Exception:
 # Express HTTP method names we recognise as route registrations
 _EXPRESS_METHODS = {"get", "post", "put", "patch", "delete", "all", "use"}
 
-# S-expression query for Express route calls:
-# app.get("/path", [middleware...], handler)
-# router.post("/path", handler)
+# tree-sitter 0.26 API: Query + QueryCursor.matches() returns
+# list of (pattern_index, dict[capture_name, list[Node]]) per match.
+# We find route calls by matching on method name + first string argument.
 _ROUTE_QUERY_PATTERN = """
 (call_expression
   function: (member_expression
-    object: (identifier) @router_obj
     property: (property_identifier) @method)
   arguments: (arguments
-    . (string) @route_path
-    (identifier)* @middleware
-    (identifier) @handler))
+    . (string) @route_path))
 """
 
 
@@ -77,29 +73,18 @@ class TreeSitterExtractor:
             raise RuntimeError("tree-sitter is not available")
 
         try:
-            from tree_sitter import Language, Query
             tree = _ts_parser.parse(js_source.encode())
-            query = _JS_LANGUAGE.query(_ROUTE_QUERY_PATTERN)
-            captures = query.captures(tree.root_node)
+            query = Query(_JS_LANGUAGE, _ROUTE_QUERY_PATTERN)
+            cursor = QueryCursor(query)
+            matches = cursor.matches(tree.root_node)
         except Exception:
             return []
 
         routes: list[RouteInfo] = []
 
-        # Group captures by their parent call_expression node
-        # captures: list of (node, capture_name) tuples
-        grouped: dict[int, dict[str, list]] = {}
-        for node, name in captures:
-            parent_id = node.parent.id if node.parent else node.id
-            if parent_id not in grouped:
-                grouped[parent_id] = {}
-            grouped[parent_id].setdefault(name, []).append(node)
-
-        for group in grouped.values():
-            method_nodes = group.get("method", [])
-            path_nodes = group.get("route_path", [])
-            middleware_nodes = group.get("middleware", [])
-            handler_nodes = group.get("handler", [])
+        for _pattern_idx, cap_dict in matches:
+            method_nodes = cap_dict.get("method", [])
+            path_nodes = cap_dict.get("route_path", [])
 
             if not method_nodes or not path_nodes:
                 continue
@@ -109,19 +94,15 @@ class TreeSitterExtractor:
                 continue
 
             raw_path = path_nodes[0].text.decode() if path_nodes[0].text else ""
-            # Strip surrounding quotes
             route = raw_path.strip("'\"` ")
             if not route.startswith("/"):
-                continue  # Not a route path (e.g. a string argument to app.set())
+                continue
 
-            middleware_names = [
-                n.text.decode() for n in middleware_nodes if n.text
-            ]
-            handler_name = (
-                handler_nodes[-1].text.decode()
-                if handler_nodes and handler_nodes[-1].text
-                else "<anonymous>"
-            )
+            # Parse middleware and handler from the arguments node directly.
+            # Arguments: (path_string, [identifier...], handler)
+            # Handler is the last arg; all identifier args before it are middleware.
+            call_node = method_nodes[0].parent.parent  # member_expr → call_expr
+            middleware_names, handler_name = self._parse_args(call_node)
 
             routes.append(
                 RouteInfo(
@@ -135,21 +116,64 @@ class TreeSitterExtractor:
 
         return routes
 
+    def _parse_args(self, call_node) -> tuple[list[str], str]:
+        """Extract (middleware_names, handler_name) from a call_expression node."""
+        args_node = call_node.child_by_field_name("arguments")
+        if not args_node:
+            return [], "<anonymous>"
+
+        # Collect named children; skip the first (route path string)
+        named = [c for c in args_node.named_children]
+        if len(named) <= 1:
+            return [], "<anonymous>"
+
+        args_after_path = named[1:]  # skip path string
+        handler_name = "<anonymous>"
+        middleware_names: list[str] = []
+
+        for child in args_after_path:
+            if child.type == "identifier":
+                middleware_names.append(child.text.decode())
+            elif child.type in ("arrow_function", "function_expression", "function"):
+                handler_name = "<anonymous>"
+            # If last was identifier it's the handler, not middleware
+        # The last identifier before an arrow/function is the handler
+        # Re-classify: if the last arg is an identifier, that's the handler
+        if args_after_path:
+            last = args_after_path[-1]
+            if last.type == "identifier" and last.text:
+                handler_name = last.text.decode()
+                middleware_names = [
+                    c.text.decode()
+                    for c in args_after_path[:-1]
+                    if c.type == "identifier" and c.text
+                ]
+
+        return middleware_names, handler_name
+
 
 # ---------------------------------------------------------------------------
 # Regex fallback extractor (used when tree-sitter is unavailable)
 # ---------------------------------------------------------------------------
 
-# Matches: app.get('/path', mw1, mw2, handler)
-#           router.post('/path', handler)
+# Matches: app.get('/path', mw1, mw2, handler)  or  app.get('/path', mw, (req,res)=>{})
+# Group 1: method, Group 2: route path, Group 3: comma-separated identifiers,
+# Group 4: presence of a trailing arrow/function expression (=> or function keyword)
 _ROUTE_RE = re.compile(
     r"""
     (?:app|router)\s*\.\s*
     (get|post|put|patch|delete|all|use)\s*\(
     \s*['"`]([^'"`]+)['"`]\s*     # route path
-    ((?:\s*,\s*\w+)*)             # optional args (middleware + handler)
+    ((?:\s*,\s*\w+)*)             # optional identifier args (middleware + named handler)
+    (?:\s*,\s*(?:\(|function\b|async\s+(?:\(|function\b)))?  # trailing arrow/function?
     """,
     re.VERBOSE | re.IGNORECASE,
+)
+
+# Separate pattern to detect if there's a trailing arrow/anonymous function argument
+_TRAILING_ANON_RE = re.compile(
+    r",\s*(?:async\s+)?(?:\([^)]*\)|[\w]+)\s*=>"
+    r"|,\s*(?:async\s+)?function\s*\(",
 )
 
 
@@ -164,8 +188,23 @@ class RegexExtractor:
             args_str = match.group(3)
 
             identifiers = [s.strip() for s in args_str.split(",") if s.strip()]
-            handler_name = identifiers[-1] if identifiers else "<anonymous>"
-            middleware_names = identifiers[:-1] if len(identifiers) > 1 else []
+
+            # Check if the source after this match has a trailing arrow/function.
+            # If so, all captured identifiers are middleware (handler is anonymous).
+            tail = js_source[match.start():]
+            has_anon_handler = bool(_TRAILING_ANON_RE.search(tail[:300]))
+
+            if has_anon_handler:
+                # All identifiers are middleware; handler is the anonymous function
+                middleware_names = identifiers
+                handler_name = "<anonymous>"
+            elif identifiers:
+                # Last identifier is the named handler; rest are middleware
+                handler_name = identifiers[-1]
+                middleware_names = identifiers[:-1]
+            else:
+                handler_name = "<anonymous>"
+                middleware_names = []
 
             routes.append(
                 RouteInfo(

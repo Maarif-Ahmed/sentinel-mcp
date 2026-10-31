@@ -103,12 +103,9 @@ class PatchGenerator:
         If not, return raw output with a disclaimer prefix so the developer
         knows to treat it as unstructured suggestions.
         """
-        cleaned = raw.strip()
+        # Always strip markdown fences first — LLMs often add them despite instructions
+        cleaned = re.sub(r"```(?:diff|patch)?\n?", "", raw).strip()
         if _DIFF_HEADER_RE.search(cleaned):
             return cleaned
-        # Strip accidental markdown fences
-        stripped = re.sub(r"```(?:diff|patch)?\n?", "", cleaned).strip()
-        if _DIFF_HEADER_RE.search(stripped):
-            return stripped
         # Not a valid diff — return with disclaimer
         return f"# WARNING: LLM did not return a valid unified diff. Raw output:\n{cleaned}"

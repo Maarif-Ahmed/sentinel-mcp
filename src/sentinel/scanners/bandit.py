@@ -147,6 +147,10 @@ class BanditAdapter(ScannerAdapter):
                 "Install with: pip install bandit"
             )
 
+        # Exclude virtual env and test dirs — scanning them adds thousands of
+        # files and blows the 60 s MCP Inspector timeout.
+        _EXCLUDE = ".venv,venv,.tox,node_modules,build,dist,__pycache__"
+
         cmd = [
             exe,
             "-r",
@@ -154,6 +158,7 @@ class BanditAdapter(ScannerAdapter):
             "-f", "json",
             "--exit-zero",   # exit 0 even when findings exist; errors are non-zero
             "-q",            # suppress progress output
+            "--exclude", _EXCLUDE,
         ]
 
         try:

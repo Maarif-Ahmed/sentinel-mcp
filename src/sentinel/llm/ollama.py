@@ -30,12 +30,16 @@ class OllamaProvider(LLMProvider):
         timeout: int = DEFAULT_TIMEOUT,
         max_tokens: int = 1024,
         temperature: float = 0.1,
+        top_p: float = 0.9,
+        repeat_penalty: float = 1.1,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._top_p = top_p
+        self._repeat_penalty = repeat_penalty
 
     @property
     def model_id(self) -> str:
@@ -54,6 +58,8 @@ class OllamaProvider(LLMProvider):
             ],
             "max_tokens": self._max_tokens,
             "temperature": self._temperature,
+            "top_p": self._top_p,
+            "repeat_penalty": self._repeat_penalty,
             "stream": False,
         }
 

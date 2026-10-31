@@ -4,9 +4,12 @@ PatchGenerator — produces unified diff patch proposals via the local LLM.
 The patch is NEVER applied automatically. It is returned as a string diff
 for the developer to review and apply manually.
 
-The LLM is prompted to return ONLY a unified diff — no prose, no markdown
-fences. We validate that the output looks like a diff before returning it.
-If validation fails, we return the raw output with a disclaimer.
+Two-phase approach:
+  Phase 1 — ask the model to describe the fix in plain English (short, focused call).
+  Phase 2 — ask the model to generate the diff given the fix description.
+
+This keeps each LLM call narrow and well-defined, which significantly
+improves output quality for small (3B) models.
 """
 
 from __future__ import annotations
@@ -17,7 +20,19 @@ from pathlib import Path
 from sentinel.llm.base import LLMProvider, LLMProviderError
 from sentinel.schemas import ContextAnnotation, RemediationProposal, SecurityFinding
 
-_SYSTEM_PROMPT = """\
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
+
+_SYSTEM_DESCRIBE = """\
+You are a security engineer reviewing code for vulnerabilities.
+Given a security finding and the affected code, respond with exactly two lines:
+Line 1: What is wrong with the line marked >>>.
+Line 2: What the minimal fix should be (plain English, no code).
+Be specific. Do not add any other text.
+"""
+
+_SYSTEM_PATCH = """\
 You are a security engineer generating minimal, targeted code patches.
 
 Rules:
@@ -28,25 +43,51 @@ Rules:
      context line
     -removed line
     +added line
-- The line marked with ">>>" in the code listing is the EXACT vulnerable line.
-  Only modify that line or its immediately containing block.
+- The line marked with ">>>" is the EXACT vulnerable line. Only modify that line.
 - Do NOT include any explanation, markdown code fences, or prose.
 - Make the smallest change that addresses the vulnerability.
-- Do not refactor unrelated code.
-- If you truly cannot produce a safe patch, output a comment line starting with: # CANNOT_PATCH:
+- If you truly cannot produce a safe patch, output: # CANNOT_PATCH: <reason>
+
+Example
+-------
+Finding: B105 hardcoded password  File: app.py  Line: 12
+Fix: Replace the hardcoded string with an environment variable lookup.
+   10     def get_token():
+   11
+   12 >>>     token = "abc123"
+   13
+   14         return token
+
+--- a/app.py
++++ b/app.py
+@@ -12,1 +12,1 @@
+-    token = "abc123"
++    token = os.environ["APP_TOKEN"]
+"""
+
+_SYSTEM_RETRY = """\
+You are a security engineer generating minimal, targeted code patches.
+Your previous attempt did not modify the correct line. Try again.
+
+Rules:
+- Return ONLY a unified diff. No prose, no markdown fences.
+- ONLY change the line explicitly shown as the vulnerable line.
+- The hunk header @@ must reference that exact line number.
+- If you truly cannot patch it safely: # CANNOT_PATCH: <reason>
 """
 
 _DIFF_HEADER_RE = re.compile(r"^--- .+\n\+\+\+ .+", re.MULTILINE)
 _HUNK_LINE_RE = re.compile(r"^@@ -(\d+)", re.MULTILINE)
 
 # Rule IDs whose flagged pattern is safer to suppress with # nosec than to patch.
-# Maps rule_id → (regex that matches the non-security use, nosec comment text)
 _NOSEC_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
     "B311": (
         re.compile(r"random\.(uniform|randint|random|choice)\b", re.I),
         "# nosec B311  # non-cryptographic use (rate-limit jitter / randomness)",
     ),
 }
+
+_CONTEXT_RADIUS = 10  # lines each side — tight enough for 3B attention
 
 
 class PatchGenerator:
@@ -72,39 +113,146 @@ class PatchGenerator:
                 generated_by="rule_based",
             )
 
-        user_prompt = self._build_prompt(finding, context)
+        file_context = self._read_file_context(finding)
+        context_block = self._format_context_block(finding, context, file_context)
 
-        try:
-            raw_output = self._llm.complete(_SYSTEM_PROMPT, user_prompt)
-        except LLMProviderError as e:
-            return RemediationProposal(
-                finding_id=finding.id,
-                patch_diff="",
-                rationale=f"LLM error: {e}",
-                generated_by=self._llm.model_id,
-            )
+        # Phase 1 — describe the fix in plain English
+        fix_description = self._describe_fix(finding, context_block)
 
-        if raw_output.strip().startswith("# CANNOT_PATCH"):
-            reason = raw_output.strip().removeprefix("# CANNOT_PATCH:").strip()
-            return RemediationProposal(
-                finding_id=finding.id,
-                patch_diff="",
-                rationale=f"LLM declined to patch: {reason or 'no reason given'}",
-                generated_by=self._llm.model_id,
-            )
-
-        patch_diff = self._extract_diff(raw_output, finding)
-        rationale = (
-            f"Patch generated by {self._llm.model_id} for {finding.rule_id} "
-            f"({finding.cwe_id or 'no CWE'}) at {finding.file_path}:{finding.line_start}"
+        # Phase 2 — generate the diff given the description
+        patch_diff, generated_by = self._generate_diff(
+            finding, context_block, fix_description
         )
 
+        rationale = (
+            f"Patch generated by {generated_by} for {finding.rule_id} "
+            f"({finding.cwe_id or 'no CWE'}) at {finding.file_path}:{finding.line_start}"
+        )
         return RemediationProposal(
             finding_id=finding.id,
             patch_diff=patch_diff,
             rationale=rationale,
-            generated_by=self._llm.model_id,
+            generated_by=generated_by,
         )
+
+    # ------------------------------------------------------------------
+    # Phase 1
+    # ------------------------------------------------------------------
+
+    def _describe_fix(self, finding: SecurityFinding, context_block: str) -> str:
+        """Ask the model to describe the fix in plain English (short focused call)."""
+        user_prompt = (
+            f"Finding: {finding.rule_id}  CWE: {finding.cwe_id or 'unknown'}\n"
+            f"Description: {finding.message}\n"
+            f"File: {finding.file_path}  Line: {finding.line_start}\n\n"
+            f"{context_block}"
+        )
+        try:
+            return self._llm.complete(_SYSTEM_DESCRIBE, user_prompt).strip()
+        except LLMProviderError:
+            return ""
+
+    # ------------------------------------------------------------------
+    # Phase 2 + retry
+    # ------------------------------------------------------------------
+
+    def _generate_diff(
+        self,
+        finding: SecurityFinding,
+        context_block: str,
+        fix_description: str,
+    ) -> tuple[str, str]:
+        """Return (patch_diff, model_id). Retries once if hunk misses the finding."""
+        user_prompt = self._build_patch_prompt(finding, context_block, fix_description)
+
+        try:
+            raw = self._llm.complete(_SYSTEM_PATCH, user_prompt)
+        except LLMProviderError as e:
+            return f"# LLM error: {e}", self._llm.model_id
+
+        if raw.strip().startswith("# CANNOT_PATCH"):
+            reason = raw.strip().removeprefix("# CANNOT_PATCH:").strip()
+            return (
+                f"# CANNOT_PATCH: {reason or 'no reason given'}",
+                self._llm.model_id,
+            )
+
+        diff = self._extract_diff(raw, finding)
+        if diff.startswith("# WARNING: patch does not address"):
+            # Retry once with the explicit line number
+            diff = self._retry_diff(finding, context_block, fix_description, raw)
+
+        return diff, self._llm.model_id
+
+    def _retry_diff(
+        self,
+        finding: SecurityFinding,
+        context_block: str,
+        fix_description: str,
+        previous_output: str,
+    ) -> str:
+        retry_prompt = (
+            f"Your previous output did not modify line {finding.line_start}.\n"
+            f"Previous output:\n{previous_output}\n\n"
+            f"Fix description: {fix_description}\n\n"
+            f"Try again. The hunk @@ must reference line {finding.line_start}.\n"
+            f"The diff header must be:\n"
+            f"--- a/{finding.file_path}\n"
+            f"+++ b/{finding.file_path}\n\n"
+            f"{context_block}"
+        )
+        try:
+            raw = self._llm.complete(_SYSTEM_RETRY, retry_prompt)
+        except LLMProviderError as e:
+            return f"# LLM error on retry: {e}"
+        return self._extract_diff(raw, finding)
+
+    # ------------------------------------------------------------------
+    # Prompt builders
+    # ------------------------------------------------------------------
+
+    def _build_patch_prompt(
+        self,
+        finding: SecurityFinding,
+        context_block: str,
+        fix_description: str,
+    ) -> str:
+        parts = [
+            f"Finding: {finding.rule_id}",
+            f"File: {finding.file_path}  Line: {finding.line_start}",
+            f"CWE: {finding.cwe_id or 'unknown'}",
+            f"Description: {finding.message}",
+        ]
+        if fix_description:
+            parts.append(f"Fix: {fix_description}")
+        parts.append(f"\n{context_block}")
+        parts.append(
+            f"\nGenerate the unified diff.\n"
+            f"The diff header must be:\n"
+            f"--- a/{finding.file_path}\n"
+            f"+++ b/{finding.file_path}"
+        )
+        return "\n".join(parts)
+
+    def _format_context_block(
+        self,
+        finding: SecurityFinding,
+        context: ContextAnnotation | None,
+        file_context: str,
+    ) -> str:
+        lines: list[str] = []
+        if context and context.route_path:
+            lines.append(f"Route: {context.route_path} {context.http_methods}")
+            if context.middleware_names:
+                lines.append(f"Middleware: {context.middleware_names}")
+        if file_context:
+            lines.append("Affected code (>>> marks the vulnerable line):")
+            lines.append(file_context)
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _nosec_suppression(self, finding: SecurityFinding) -> str:
         """Return a # nosec diff if the finding matches a known safe-to-suppress pattern."""
@@ -115,12 +263,10 @@ class PatchGenerator:
         snippet = finding.snippet or ""
         if not pattern.search(snippet):
             return ""
-        # Read the actual flagged line to build a precise diff
         try:
             full_path = self._repo_root / finding.file_path
             all_lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
-            line_idx = finding.line_start - 1
-            original = all_lines[line_idx]
+            original = all_lines[finding.line_start - 1]
             patched = original.rstrip() + "  " + nosec_comment
             return (
                 f"--- a/{finding.file_path}\n"
@@ -132,49 +278,15 @@ class PatchGenerator:
         except Exception:
             return ""
 
-    def _build_prompt(
-        self, finding: SecurityFinding, context: ContextAnnotation | None
-    ) -> str:
-        lines: list[str] = [
-            f"Finding: {finding.rule_id}",
-            f"File: {finding.file_path}  Lines: {finding.line_start}–{finding.line_end}",
-            f"Severity: {finding.severity}  Confidence: {finding.confidence}",
-            f"CWE: {finding.cwe_id or 'unknown'}",
-            f"Description: {finding.message}",
-        ]
-
-        if context and context.route_path:
-            lines.append(f"Route context: {context.route_path} {context.http_methods}")
-            if context.middleware_names:
-                lines.append(f"Middleware: {context.middleware_names}")
-
-        # Read wider context from the actual file (30 lines each side), marking the vulnerable line
-        file_context = self._read_file_context(finding)
-        if file_context:
-            lines.append("\nAffected code (with surrounding context; >>> marks the vulnerable line):")
-            lines.append(file_context)
-        elif finding.snippet:
-            lines.append("\nAffected code:")
-            lines.append(finding.snippet)
-
-        lines.append(
-            f"\nGenerate a minimal unified diff to fix this vulnerability.\n"
-            f"Only modify the line(s) marked with >>>.\n"
-            f"The diff header must be:\n"
-            f"--- a/{finding.file_path}\n"
-            f"+++ b/{finding.file_path}"
-        )
-        return "\n".join(lines)
-
-    def _read_file_context(self, finding: SecurityFinding, radius: int = 30) -> str:
-        """Read ±radius lines around the finding, marking the vulnerable line(s) with >>>."""
+    def _read_file_context(self, finding: SecurityFinding) -> str:
+        """Read ±CONTEXT_RADIUS lines around the finding, marking the vulnerable line(s)."""
         try:
             full_path = self._repo_root / finding.file_path
             if not full_path.exists():
                 return ""
             all_lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
-            start = max(0, finding.line_start - 1 - radius)
-            end = min(len(all_lines), finding.line_end + radius)
+            start = max(0, finding.line_start - 1 - _CONTEXT_RADIUS)
+            end = min(len(all_lines), finding.line_end + _CONTEXT_RADIUS)
             numbered_lines = []
             for i, line in enumerate(all_lines[start:end], start=start):
                 lineno = i + 1
@@ -185,25 +297,19 @@ class PatchGenerator:
             return ""
 
     def _extract_diff(self, raw: str, finding: SecurityFinding | None = None) -> str:
-        """
-        Validate the LLM output is a unified diff and that it covers the finding's line.
-        Returns the diff, a coverage warning, or a raw-output disclaimer.
-        """
-        # Strip markdown fences — LLMs often add them despite instructions
+        """Validate the LLM output is a unified diff covering the finding's line."""
         cleaned = re.sub(r"```(?:diff|patch)?\n?", "", raw).strip()
         if not _DIFF_HEADER_RE.search(cleaned):
             return f"# WARNING: LLM did not return a valid unified diff. Raw output:\n{cleaned}"
-
         if finding and not self._patch_covers_finding(cleaned, finding):
             return (
                 f"# WARNING: patch does not address the flagged line "
                 f"({finding.file_path}:{finding.line_start}). Review carefully.\n{cleaned}"
             )
-
         return cleaned
 
     def _patch_covers_finding(self, diff: str, finding: SecurityFinding) -> bool:
-        """Return True if any hunk in the diff is within 5 lines of the finding."""
+        """Return True if any hunk is within 5 lines of the finding."""
         for m in _HUNK_LINE_RE.finditer(diff):
             if abs(int(m.group(1)) - finding.line_start) <= 5:
                 return True

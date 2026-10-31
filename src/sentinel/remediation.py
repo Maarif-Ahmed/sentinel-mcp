@@ -21,11 +21,17 @@ _SYSTEM_PROMPT = """\
 You are a security engineer generating minimal, targeted code patches.
 
 Rules:
-- Return ONLY a unified diff (--- a/file ... +++ b/file ... @@ ... format).
+- Return ONLY a unified diff in standard format:
+    --- a/filename
+    +++ b/filename
+    @@ -line,count +line,count @@
+     context line
+    -removed line
+    +added line
 - Do NOT include any explanation, markdown code fences, or prose.
 - Make the smallest change that addresses the vulnerability.
 - Do not refactor unrelated code.
-- If you cannot generate a safe, targeted patch, return only the text: CANNOT_PATCH
+- If you truly cannot produce a safe patch, output a comment line starting with: # CANNOT_PATCH:
 """
 
 _DIFF_HEADER_RE = re.compile(r"^--- .+\n\+\+\+ .+", re.MULTILINE)
@@ -53,11 +59,12 @@ class PatchGenerator:
                 generated_by=self._llm.model_id,
             )
 
-        if raw_output.strip() == "CANNOT_PATCH":
+        if raw_output.strip().startswith("# CANNOT_PATCH"):
+            reason = raw_output.strip().removeprefix("# CANNOT_PATCH:").strip()
             return RemediationProposal(
                 finding_id=finding.id,
                 patch_diff="",
-                rationale="LLM determined it cannot generate a safe, targeted patch for this finding.",
+                rationale=f"LLM declined to patch: {reason or 'no reason given'}",
                 generated_by=self._llm.model_id,
             )
 
@@ -90,12 +97,38 @@ class PatchGenerator:
             if context.middleware_names:
                 lines.append(f"Middleware: {context.middleware_names}")
 
-        if finding.snippet:
+        # Read wider context from the actual file (30 lines each side)
+        file_context = self._read_file_context(finding)
+        if file_context:
+            lines.append("\nAffected code (with surrounding context):")
+            lines.append(file_context)
+        elif finding.snippet:
             lines.append("\nAffected code:")
             lines.append(finding.snippet)
 
-        lines.append("\nGenerate a minimal unified diff to fix this vulnerability.")
+        lines.append(
+            f"\nGenerate a minimal unified diff to fix this vulnerability.\n"
+            f"The diff header must be:\n"
+            f"--- a/{finding.file_path}\n"
+            f"+++ b/{finding.file_path}"
+        )
         return "\n".join(lines)
+
+    def _read_file_context(self, finding: SecurityFinding, radius: int = 30) -> str:
+        """Read ±radius lines around the finding from the actual file."""
+        try:
+            full_path = self._repo_root / finding.file_path
+            if not full_path.exists():
+                return ""
+            all_lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            start = max(0, finding.line_start - 1 - radius)
+            end = min(len(all_lines), finding.line_end + radius)
+            numbered = "\n".join(
+                f"{i + 1:4d}  {l}" for i, l in enumerate(all_lines[start:end], start=start)
+            )
+            return numbered
+        except Exception:
+            return ""
 
     def _extract_diff(self, raw: str) -> str:
         """

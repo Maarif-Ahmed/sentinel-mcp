@@ -389,12 +389,39 @@ class PatchGenerator:
         cleaned = re.sub(r"```(?:diff|patch)?\n?", "", raw).strip()
         if not _DIFF_HEADER_RE.search(cleaned):
             return f"# WARNING: LLM did not return a valid unified diff. Raw output:\n{cleaned}"
+        if not self._hunk_lines_valid(cleaned):
+            return (
+                f"# WARNING: diff header present but hunk lines are malformed "
+                f"(model returned context block instead of diff lines). Raw output:\n{cleaned}"
+            )
         if finding and not self._patch_covers_finding(cleaned, finding):
             return (
                 f"# WARNING: patch does not address the flagged line "
                 f"({finding.file_path}:{finding.line_start}). Review carefully.\n{cleaned}"
             )
         return cleaned
+
+    @staticmethod
+    def _hunk_lines_valid(diff: str) -> bool:
+        """Return True if every line inside a hunk starts with ' ', '-', '+', '@', or '\\'.
+
+        Rejects output where the model returned the numbered context block
+        (lines like '  123 >>> content' or '  123     content') instead of
+        actual diff lines.
+        """
+        in_hunk = False
+        for line in diff.splitlines():
+            if line.startswith("@@"):
+                in_hunk = True
+                continue
+            if line.startswith(("--- ", "+++ ")):
+                continue
+            if in_hunk:
+                if not line:
+                    continue
+                if line[0] not in (" ", "-", "+", "\\"):
+                    return False
+        return True
 
     def _patch_covers_finding(self, diff: str, finding: SecurityFinding) -> bool:
         """Return True if any hunk is within 5 lines of the finding."""

@@ -1,7 +1,7 @@
 """
 benchmarks/rq4_latency.py — RQ4: LLM latency and VRAM experiment.
 
-Compares Qwen2.5-Coder 3B vs 7B Q4_K_M on the explain_finding task.
+Benchmarks Qwen2.5-Coder 3B Q4_K_M on the explain_finding task (RQ4).
 
 Metrics (per model, N=10 timed runs across 5 fixed findings):
   - Wall-clock latency per call (ms)
@@ -275,7 +275,7 @@ def main() -> None:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["qwen2.5-coder:3b", "qwen2.5-coder:7b-instruct-q4_K_M"],
+        default=["qwen2.5-coder:3b"],
         help="Ollama model tags to benchmark",
     )
     parser.add_argument("--trials", type=int, default=10, help="Timed runs per model")

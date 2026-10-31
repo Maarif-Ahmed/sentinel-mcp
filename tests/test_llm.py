@@ -34,8 +34,8 @@ class TestOllamaProviderUnit:
         assert provider.model_id == DEFAULT_MODEL
 
     def test_model_id_custom(self):
-        provider = OllamaProvider(model="qwen2.5-coder:7b")
-        assert provider.model_id == "qwen2.5-coder:7b"
+        provider = OllamaProvider(model="qwen2.5-coder:3b")
+        assert provider.model_id == "qwen2.5-coder:3b"
 
     def test_is_available_returns_false_gracefully_when_down(self):
         """is_available() must return False (not raise) when Ollama is unreachable."""

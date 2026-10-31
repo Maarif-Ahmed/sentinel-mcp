@@ -8,8 +8,8 @@ version = "0.1.0"
 description = "Context-aware AI agent for automated web application security analysis and verified remediation"
 requires-python = ">=3.11"
 dependencies = [
-    # MCP server — pin minor, allow patch updates
-    "mcp[cli]>=1.9.0,<3.0",
+    # MCP server — mcp 2.x renamed FastMCP→MCPServer; import from mcp.server.mcpserver
+    "mcp>=2.0.0,<3.0",
     # Data validation — pin major
     "pydantic>=2.11.0,<3.0",
     # Context graph

@@ -1,0 +1,7 @@
+# Intentionally pinned to old versions with known CVEs — Trivy scanner fixture.
+# DO NOT use in any real project.
+flask==0.12.2
+requests==2.18.0
+pyyaml==3.13
+pillow==5.4.1
+django==2.0.0

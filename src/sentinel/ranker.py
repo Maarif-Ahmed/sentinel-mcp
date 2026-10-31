@@ -89,8 +89,12 @@ class RuleBasedRanker(RankerProvider):
         exposure_bonus = 0.0
         auth_penalty = 0.0
         if context is not None and context.route_path is not None:
-            mw_lower = {m.lower() for m in context.middleware_names}
-            has_auth_hint = bool(mw_lower & _AUTH_MIDDLEWARE_HINTS)
+            mw_lower = [m.lower() for m in context.middleware_names]
+            has_auth_hint = any(
+                hint in mw_name
+                for mw_name in mw_lower
+                for hint in _AUTH_MIDDLEWARE_HINTS
+            )
 
             if not has_auth_hint:
                 # No named auth middleware found — treat as publicly exposed

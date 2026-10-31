@@ -66,11 +66,48 @@ _SEVERITY_COLOR = {
 }
 
 
+def _severity_counts(findings: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for item in findings:
+        sev = item["finding"].get("severity", "info")
+        if sev in counts:
+            counts[sev] += 1
+    return counts
+
+
+def _scanner_counts(findings: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in findings:
+        s = item["finding"].get("scanner", "unknown")
+        counts[s] = counts.get(s, 0) + 1
+    return counts
+
+
 def _render_html(data: dict) -> str:
     findings = data["findings"]
     generated_at = data["generated_at"]
     version = data["sentinel_version"]
     count = data["finding_count"]
+
+    sev_counts = _severity_counts(findings)
+    scanner_counts = _scanner_counts(findings)
+
+    # Summary cards: severity breakdown
+    sev_cards = ""
+    for sev, color in _SEVERITY_COLOR.items():
+        n = sev_counts.get(sev, 0)
+        if n > 0:
+            sev_cards += (
+                f'<div class="card" style="border-top:3px solid {color}">'
+                f'<div class="num" style="color:{color}">{n}</div>'
+                f'<div class="lbl">{sev.upper()}</div></div>'
+            )
+
+    # Scanner breakdown
+    scanner_bits = "  ".join(
+        f'<span class="badge" style="background:#334155">{s}: {n}</span>'
+        for s, n in scanner_counts.items()
+    )
 
     rows = []
     for item in findings:
@@ -97,8 +134,8 @@ def _render_html(data: dict) -> str:
 
     rows_html = "\n".join(rows) if rows else "<tr><td colspan='8'>No findings.</td></tr>"
 
-    # Embed full JSON for download
-    json_blob = json.dumps(data, default=str)
+    # Embed full JSON for download; escape </ to prevent </script> injection
+    json_blob = json.dumps(data, default=str).replace("</", "<\\/")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -133,8 +170,10 @@ def _render_html(data: dict) -> str:
 <p class="meta">Generated {generated_at} &nbsp;·&nbsp; Sentinel v{version}</p>
 
 <div class="summary">
-  <div class="card"><div class="num">{count}</div><div class="lbl">Findings</div></div>
+  <div class="card"><div class="num">{count}</div><div class="lbl">Total</div></div>
+  {sev_cards}
 </div>
+<p class="meta">Scanners: {scanner_bits}</p>
 
 <table>
 <thead>

@@ -18,7 +18,9 @@ from pathlib import Path
 import pytest
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
-REQUIREMENTS_FIXTURE = FIXTURE_DIR / "requirements_vulnerable.txt"
+# Trivy only recognises files named exactly "requirements.txt"; use a subdirectory
+# so the fixture doesn't interfere with the project's own lockfiles.
+TRIVY_TARGET = FIXTURE_DIR / "trivy_target"
 
 trivy_missing = shutil.which("trivy") is None
 
@@ -36,15 +38,15 @@ class TestTrivyAdapter:
         from sentinel.scanners.trivy import TrivyAdapter
 
         adapter = TrivyAdapter()
-        findings = adapter.run(FIXTURE_DIR)
-        assert len(findings) >= 1, "Expected ≥1 CVE finding from requirements_vulnerable.txt"
+        findings = adapter.run(TRIVY_TARGET)
+        assert len(findings) >= 1, "Expected ≥1 CVE finding from trivy_target/requirements.txt"
 
     def test_trivy_finding_has_cve_rule_id(self):
         """At least one finding must be a CVE (rule_id starts with CVE-)."""
         from sentinel.scanners.trivy import TrivyAdapter
 
         adapter = TrivyAdapter()
-        findings = adapter.run(FIXTURE_DIR)
+        findings = adapter.run(TRIVY_TARGET)
         cve_findings = [f for f in findings if f.rule_id.startswith("CVE-")]
         assert cve_findings, f"Expected CVE findings, got rule_ids: {[f.rule_id for f in findings[:5]]}"
 
@@ -53,7 +55,7 @@ class TestTrivyAdapter:
         from sentinel.scanners.trivy import TrivyAdapter
 
         adapter = TrivyAdapter()
-        findings = adapter.run(FIXTURE_DIR)
+        findings = adapter.run(TRIVY_TARGET)
         assert findings, "No findings returned"
 
         for f in findings:
@@ -70,10 +72,10 @@ class TestTrivyAdapter:
         from sentinel.scanners.trivy import TrivyAdapter
 
         adapter = TrivyAdapter()
-        raw = adapter.run(FIXTURE_DIR)
+        raw = adapter.run(TRIVY_TARGET)
         assert raw, "TrivyAdapter returned no findings"
 
-        normalizer = FindingNormalizer(FIXTURE_DIR)
+        normalizer = FindingNormalizer(TRIVY_TARGET)
         findings = normalizer.normalize(raw)
 
         assert len(findings) >= 1

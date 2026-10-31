@@ -78,6 +78,7 @@ class TrivyAdapter(ScannerAdapter):
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",  # Trivy JSON output is UTF-8; Windows default (cp1252) fails
                 timeout=180,  # 3-minute limit; first run downloads DB
             )
         except subprocess.TimeoutExpired as e:

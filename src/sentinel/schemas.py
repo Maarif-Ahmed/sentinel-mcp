@@ -12,7 +12,7 @@ enforcement unless the evidence actually supports it.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 from uuid import uuid4
 
@@ -181,7 +181,7 @@ class AuditEvent(BaseModel):
     """Append-only audit record written to SQLite for every tool invocation."""
 
     id: str = Field(default_factory=lambda: str(uuid4()))
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     event_type: str  # e.g. "scan_repository", "explain_finding", "propose_fix"
     repository_root: str
     finding_canonical_id: str | None = None

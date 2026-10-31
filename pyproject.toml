@@ -17,6 +17,8 @@ dependencies = [
     # Tree-sitter (C extension — see docs/research/setup-windows.md for MSVC requirement)
     "tree-sitter>=0.23.0,<1.0",
     "tree-sitter-javascript>=0.23.0,<1.0",
+    # File-system watching for continuous scan mode
+    "watchdog>=4.0,<5.0",
 ]
 
 [project.optional-dependencies]

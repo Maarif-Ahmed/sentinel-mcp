@@ -95,6 +95,7 @@ class FindingNormalizer:
             cwe_id=raw.cwe_id,
             message=raw.message,
             snippet=snippet,
+            is_dev_dependency=bool(raw.extra.get("is_dev_dependency", False)),
         )
 
     def _to_posix_relative(self, path_str: str) -> str | None:

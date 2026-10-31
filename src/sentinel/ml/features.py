@@ -5,19 +5,20 @@ Extracts a fixed-length numeric feature vector from a SecurityFinding +
 optional ContextAnnotation. The same extractor is used at train time
 (benchmarks/evaluate.py) and at inference time (MLRanker.rank()).
 
-Feature vector (12 dimensions):
+Feature vector (13 dimensions):
   0  severity_score      — scanner-reported severity: critical=4, high=3, medium=2, low=1, info=0
   1  confidence_score    — scanner confidence: high=2, medium=1, low=0
   2  is_dependency       — 1 if scanner=="trivy" (supply-chain surface), else 0
-  3  cwe_high_impact     — 1 if CWE in the high-impact web CWE set, else 0
-  4  cwe_injection       — 1 if CWE is an injection class (SQLi/XSS/CMDi/etc.)
-  5  cwe_authn           — 1 if CWE is an authentication class
-  6  cwe_path_traversal  — 1 if CWE-22 / CWE-23
-  7  has_route           — 1 if route attribution is available
-  8  route_depth         — number of segments in the route path (0 if none)
-  9  has_auth_middleware — 1 if any middleware name matches an auth hint
-  10 middleware_count    — number of middleware names on the route
-  11 exposure_score      — 1.0 if route with no auth hint; 0.5 if route with auth hint; 0.0 if no route
+  3  is_dev_dependency   — 1 if finding is in a devDependency (from package-lock.json)
+  4  cwe_high_impact     — 1 if CWE in the high-impact web CWE set, else 0
+  5  cwe_injection       — 1 if CWE is an injection class (SQLi/XSS/CMDi/etc.)
+  6  cwe_authn           — 1 if CWE is an authentication class
+  7  cwe_path_traversal  — 1 if CWE-22 / CWE-23
+  8  has_route           — 1 if route attribution is available
+  9  route_depth         — number of segments in the route path (0 if none)
+  10 has_auth_middleware — 1 if any middleware name matches an auth hint
+  11 middleware_count    — number of middleware names on the route
+  12 exposure_score      — 1.0 if route with no auth hint; 0.5 if route with auth hint; 0.0 if no route
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ FEATURE_NAMES = [
     "severity_score",
     "confidence_score",
     "is_dependency",
+    "is_dev_dependency",
     "cwe_high_impact",
     "cwe_injection",
     "cwe_authn",
@@ -56,6 +58,7 @@ def extract(
     sev = float(_SEVERITY_SCORE.get(finding.severity, 0))
     conf = float(_CONFIDENCE_SCORE.get(finding.confidence, 0))
     is_dep = 1.0 if finding.scanner == "trivy" else 0.0
+    is_dev = 1.0 if getattr(finding, "is_dev_dependency", False) else 0.0
     cwe_hi = 1.0 if cwe in _HIGH_IMPACT_CWES else 0.0
     cwe_inj = 1.0 if cwe in _INJECTION_CWES else 0.0
     cwe_auth = 1.0 if cwe in _AUTHN_CWES else 0.0
@@ -82,6 +85,7 @@ def extract(
         sev,
         conf,
         is_dep,
+        is_dev,
         cwe_hi,
         cwe_inj,
         cwe_auth,

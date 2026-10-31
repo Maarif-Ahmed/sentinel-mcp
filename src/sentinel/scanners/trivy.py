@@ -46,6 +46,40 @@ def _cvss_to_confidence(cvss_score: float | None) -> str:
     return "low"
 
 
+def _load_npm_dev_packages(repo_path: Path) -> set[str]:
+    """
+    Parse package-lock.json v2/v3 and return the set of package names
+    that are dev-only dependencies (devDependencies in package.json).
+
+    Returns an empty set if no package-lock.json is found or parsing fails.
+    """
+    lock = repo_path / "package-lock.json"
+    if not lock.exists():
+        return set()
+    try:
+        data = json.loads(lock.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return set()
+
+    dev_names: set[str] = set()
+
+    # lockfile v2/v3: "packages" maps "node_modules/<name>" → {dev: true}
+    for key, meta in data.get("packages", {}).items():
+        if isinstance(meta, dict) and meta.get("dev") is True:
+            dev_names.add(key.removeprefix("node_modules/"))
+
+    # lockfile v1 / v2 compat: "dependencies" maps "<name>" → {dev: true, ...}
+    for name, meta in data.get("dependencies", {}).items():
+        if isinstance(meta, dict) and meta.get("dev") is True:
+            dev_names.add(name)
+
+    # package.json top-level devDependencies (belt-and-suspenders)
+    for name in data.get("devDependencies", {}).keys():
+        dev_names.add(name)
+
+    return dev_names
+
+
 class TrivyAdapter(ScannerAdapter):
     """Runs Trivy filesystem scan and returns dependency + secret findings."""
 
@@ -107,9 +141,10 @@ class TrivyAdapter(ScannerAdapter):
                 f"trivy produced invalid JSON output: {e}"
             ) from e
 
-        return self._parse_results(data, repo_path)
+        dev_packages = _load_npm_dev_packages(repo_path)
+        return self._parse_results(data, repo_path, dev_packages)
 
-    def _parse_results(self, data: dict, repo_path: Path) -> list[RawFinding]:
+    def _parse_results(self, data: dict, repo_path: Path, dev_packages: set[str] | None = None) -> list[RawFinding]:
         findings: list[RawFinding] = []
         results: list[dict] = data.get("Results", [])
 
@@ -137,6 +172,7 @@ class TrivyAdapter(ScannerAdapter):
                 if fixed_version:
                     message += f". Fixed in: {fixed_version}"
 
+                is_dev = pkg_name in (dev_packages or set())
                 findings.append(
                     RawFinding(
                         scanner="trivy",
@@ -155,6 +191,7 @@ class TrivyAdapter(ScannerAdapter):
                             "result_type": result_type,
                             "cvss_score": cvss_score,
                             "primary_url": vuln.get("PrimaryURL", ""),
+                            "is_dev_dependency": is_dev,
                         },
                     )
                 )

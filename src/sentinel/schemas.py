@@ -60,6 +60,7 @@ class SecurityFinding(BaseModel):
     cwe_id: str | None = None  # e.g. "CWE-78"
     message: str
     snippet: str | None = None  # ≤10 lines of surrounding source context
+    is_dev_dependency: bool = False  # True when finding is in a dev/test dep (Trivy npm)
 
     @staticmethod
     def make_canonical_id(posix_path: str, line_start: int, cwe_or_rule: str) -> str:

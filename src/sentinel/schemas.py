@@ -137,6 +137,7 @@ class RemediationProposal(BaseModel):
     patch_diff: str  # unified diff format
     rationale: str  # why this patch addresses the finding
     generated_by: str  # Ollama model ID, e.g. "qwen2.5-coder:3b"
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
     requires_developer_action: bool = True
 
     def model_post_init(self, __context: object) -> None:

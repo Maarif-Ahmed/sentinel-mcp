@@ -46,6 +46,7 @@ _active_watchers: dict[str, str] = {}
 # Lazy singletons (initialized on first use)
 _orchestrator = None
 _llm = None
+_router = None
 _audit_logger = None
 
 
@@ -63,6 +64,14 @@ def _get_llm():
         from sentinel.llm.ollama import OllamaProvider
         _llm = OllamaProvider()
     return _llm
+
+
+def _get_router():
+    global _router
+    if _router is None:
+        from sentinel.llm.router import ModelRouter
+        _router = ModelRouter()
+    return _router
 
 
 def _get_audit_logger():
@@ -201,10 +210,12 @@ def explain_finding(finding_id: str, repo_path: str) -> dict:
     system_prompt, user_prompt = _build_explain_prompt(ef)
 
     try:
-        llm = _get_llm()
+        router = _get_router()
+        from sentinel.llm.router import TASK_EXPLAIN
+        llm = router.for_task(TASK_EXPLAIN)
         explanation = llm.complete(system_prompt, user_prompt)
         _log("explain_finding", str(resolved), "explain", "success",
-             finding_canonical_id=finding.canonical_id)
+             finding_canonical_id=ef.finding.canonical_id)
         return {
             "finding_id": finding_id,
             "explanation": explanation,
@@ -277,7 +288,7 @@ def propose_fix(finding_id: str, repo_path: str) -> dict:
         )
 
     from sentinel.remediation import PatchGenerator
-    generator = PatchGenerator(_get_llm(), resolved)
+    generator = PatchGenerator(_get_llm(), resolved, router=_get_router())
     proposal = generator.generate(ef.finding, ef.context)
 
     _proposals[proposal.id] = proposal

@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 from sentinel.llm.base import LLMProvider, LLMProviderError
+from sentinel.llm.router import CONFIDENCE_THRESHOLD, TASK_FALLBACK, TASK_PATCH, ModelRouter
 from sentinel.schemas import ContextAnnotation, RemediationProposal, SecurityFinding
 
 # ---------------------------------------------------------------------------
@@ -103,9 +104,15 @@ _CONTEXT_RADIUS = 10  # lines each side — tight enough for 3B attention
 
 
 class PatchGenerator:
-    def __init__(self, llm: LLMProvider, repo_root: Path) -> None:
+    def __init__(
+        self,
+        llm: LLMProvider,
+        repo_root: Path,
+        router: ModelRouter | None = None,
+    ) -> None:
         self._llm = llm
         self._repo_root = repo_root
+        self._router = router
 
     def generate(
         self,
@@ -123,18 +130,37 @@ class PatchGenerator:
                     f"non-cryptographic use of randomness. Added # nosec comment."
                 ),
                 generated_by="rule_based",
+                confidence_score=1.0,
             )
 
         file_context = self._read_file_context(finding)
         context_block = self._format_context_block(finding, context, file_context)
 
+        # Pick the specialist patch model when a router is available
+        patch_llm = self._router.for_task(TASK_PATCH) if self._router else self._llm
+
         # Phase 1 — describe the fix in plain English
-        fix_description = self._describe_fix(finding, context_block)
+        fix_description = self._describe_fix(finding, context_block, patch_llm)
 
         # Phase 2 — generate the diff given the description
         patch_diff, generated_by = self._generate_diff(
-            finding, context_block, fix_description
+            finding, context_block, fix_description, patch_llm
         )
+
+        # Confidence scoring + cascade (router path only)
+        confidence = 0.0
+        if self._router and not patch_diff.startswith("#"):
+            confidence = self._router.confidence_score(patch_diff, finding, patch_llm)
+            if confidence < CONFIDENCE_THRESHOLD:
+                fallback_llm = self._router.for_task(TASK_FALLBACK)
+                fb_desc = self._describe_fix(finding, context_block, fallback_llm)
+                fb_diff, fb_model = self._generate_diff(
+                    finding, context_block, fb_desc, fallback_llm
+                )
+                if not fb_diff.startswith("#"):
+                    fb_conf = self._router._structural_score(fb_diff, finding)
+                    if fb_conf > confidence:
+                        patch_diff, generated_by, confidence = fb_diff, fb_model, fb_conf
 
         method = "reconstructed via difflib" if "+difflib" in generated_by else "generated"
         rationale = (
@@ -146,14 +172,21 @@ class PatchGenerator:
             patch_diff=patch_diff,
             rationale=rationale,
             generated_by=generated_by,
+            confidence_score=round(confidence, 4),
         )
 
     # ------------------------------------------------------------------
     # Phase 1
     # ------------------------------------------------------------------
 
-    def _describe_fix(self, finding: SecurityFinding, context_block: str) -> str:
+    def _describe_fix(
+        self,
+        finding: SecurityFinding,
+        context_block: str,
+        llm: LLMProvider | None = None,
+    ) -> str:
         """Ask the model to describe the fix in plain English (short focused call)."""
+        _llm = llm or self._llm
         user_prompt = (
             f"Finding: {finding.rule_id}  CWE: {finding.cwe_id or 'unknown'}\n"
             f"Description: {finding.message}\n"
@@ -161,7 +194,7 @@ class PatchGenerator:
             f"{context_block}"
         )
         try:
-            return self._llm.complete(_SYSTEM_DESCRIBE, user_prompt).strip()
+            return _llm.complete(_SYSTEM_DESCRIBE, user_prompt).strip()
         except LLMProviderError:
             return ""
 
@@ -174,6 +207,7 @@ class PatchGenerator:
         finding: SecurityFinding,
         context_block: str,
         fix_description: str,
+        llm: LLMProvider | None = None,
     ) -> tuple[str, str]:
         """Return (patch_diff, model_id).
 
@@ -181,38 +215,42 @@ class PatchGenerator:
         which offloads all diff formatting to Python. Falls back to asking the
         model to produce a full diff (Phase 2b) with one retry on miss.
         """
+        _llm = llm or self._llm
+
         # Phase 2a — OLD/NEW lines + difflib reconstruction (single-line only)
         if finding.line_start == finding.line_end:
-            old_text, new_text = self._ask_old_new(finding, fix_description, context_block)
+            old_text, new_text = self._ask_old_new(finding, fix_description, context_block, _llm)
             if old_text and new_text:
                 reconstructed = self._reconstruct_diff(finding, old_text, new_text)
                 if reconstructed:
-                    return reconstructed, f"{self._llm.model_id}+difflib"
+                    return reconstructed, f"{_llm.model_id}+difflib"
 
         # Phase 2b — ask the model to produce the full diff
         user_prompt = self._build_patch_prompt(finding, context_block, fix_description)
         try:
-            raw = self._llm.complete(_SYSTEM_PATCH, user_prompt)
+            raw = _llm.complete(_SYSTEM_PATCH, user_prompt)
         except LLMProviderError as e:
-            return f"# LLM error: {e}", self._llm.model_id
+            return f"# LLM error: {e}", _llm.model_id
 
         if raw.strip().startswith("# CANNOT_PATCH"):
             reason = raw.strip().removeprefix("# CANNOT_PATCH:").strip()
-            return f"# CANNOT_PATCH: {reason or 'no reason given'}", self._llm.model_id
+            return f"# CANNOT_PATCH: {reason or 'no reason given'}", _llm.model_id
 
         diff = self._extract_diff(raw, finding)
         if diff.startswith("# WARNING: patch does not address"):
-            diff = self._retry_diff(finding, context_block, fix_description, raw)
+            diff = self._retry_diff(finding, context_block, fix_description, raw, _llm)
 
-        return diff, self._llm.model_id
+        return diff, _llm.model_id
 
     def _ask_old_new(
         self,
         finding: SecurityFinding,
         fix_description: str,
         context_block: str,
+        llm: LLMProvider | None = None,
     ) -> tuple[str, str]:
         """Ask the model for the exact old line and its replacement. Returns ('', '') on failure."""
+        _llm = llm or self._llm
         user_prompt = (
             f"Finding: {finding.rule_id}  CWE: {finding.cwe_id or 'unknown'}\n"
             f"Description: {finding.message}\n"
@@ -221,7 +259,7 @@ class PatchGenerator:
             f"{context_block}"
         )
         try:
-            raw = self._llm.complete(_SYSTEM_LINES, user_prompt).strip()
+            raw = _llm.complete(_SYSTEM_LINES, user_prompt).strip()
             return self._parse_old_new(raw)
         except LLMProviderError:
             return "", ""
@@ -278,7 +316,9 @@ class PatchGenerator:
         context_block: str,
         fix_description: str,
         previous_output: str,
+        llm: LLMProvider | None = None,
     ) -> str:
+        _llm = llm or self._llm
         retry_prompt = (
             f"Your previous output did not modify line {finding.line_start}.\n"
             f"Previous output:\n{previous_output}\n\n"
@@ -290,7 +330,7 @@ class PatchGenerator:
             f"{context_block}"
         )
         try:
-            raw = self._llm.complete(_SYSTEM_RETRY, retry_prompt)
+            raw = _llm.complete(_SYSTEM_RETRY, retry_prompt)
         except LLMProviderError as e:
             return f"# LLM error on retry: {e}"
         return self._extract_diff(raw, finding)

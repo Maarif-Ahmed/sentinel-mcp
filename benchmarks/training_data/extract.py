@@ -195,12 +195,41 @@ def load_from_huggingface(
     for row in ds:
         if limit and count >= limit:
             break
-        filename = row.get("filename") or row.get("file_name") or ""
-        if not _is_python(filename):
-            continue
-        diff = row.get("diff") or ""
-        code_before = row.get("code_before") or row.get("before") or ""
-        code_after  = row.get("code_after")  or row.get("after")  or ""
+
+        # --- Schema normalisation ---
+        # hitoshura25/cvefixes: file_paths is a list; code fields use different names
+        file_paths = row.get("file_paths")
+        if isinstance(file_paths, list):
+            # Pick first Python file from the list; skip row if none
+            py_files = [f for f in file_paths if _is_python(f)]
+            if not py_files:
+                continue
+            filename = py_files[0]
+            # Filter: row-level language field must be Python too
+            if row.get("language", "").lower() not in ("python", ""):
+                continue
+        else:
+            filename = row.get("filename") or row.get("file_name") or ""
+            if not _is_python(filename):
+                continue
+
+        diff = (
+            row.get("diff_with_context")
+            or row.get("diff")
+            or ""
+        )
+        code_before = (
+            row.get("code_before")
+            or row.get("before")
+            or row.get("vulnerable_code")
+            or ""
+        )
+        code_after = (
+            row.get("code_after")
+            or row.get("after")
+            or row.get("fixed_code")
+            or ""
+        )
         rec = PairRecord(
             cve_id=row.get("cve_id") or row.get("CVE_ID") or "UNKNOWN",
             cwe_id=row.get("cwe_id") or row.get("CWE_ID"),

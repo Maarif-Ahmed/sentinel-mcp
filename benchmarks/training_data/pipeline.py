@@ -146,12 +146,13 @@ def run(
     limit: int,
     target: int,
     use_gate: bool,
+    skip_bandit: bool,
     verbose: bool,
 ) -> None:
     from benchmarks.training_data.extract import load_from_sqlite, load_from_huggingface
     from benchmarks.training_data.scan import passes_quality_gate
     from benchmarks.training_data.format_dataset import (
-        format_instruction_pair, write_jsonl, write_metadata_csv
+        format_instruction_pair, format_cve_pair, write_jsonl, write_metadata_csv
     )
 
     # 1 — Source
@@ -180,40 +181,50 @@ def run(
         if target and len(accepted) >= target:
             break
 
-        if use_gate:
-            ok, findings = passes_quality_gate(
-                record.code_before, record.code_after, record.filename
-            )
+        if skip_bandit:
+            # Accept all CVE-fix pairs; validate diff format only
+            example = format_cve_pair(record)
+            if example is None:
+                skipped_no_format += 1
+                if verbose:
+                    print(f"  SKIP (bad diff): {record.cve_id} {record.filename}")
+                continue
         else:
-            from benchmarks.training_data.scan import scan_snippet
-            findings = scan_snippet(record.code_before, record.filename)
-            ok = bool(findings)
+            if use_gate:
+                ok, findings = passes_quality_gate(
+                    record.code_before, record.code_after, record.filename
+                )
+            else:
+                from benchmarks.training_data.scan import scan_snippet
+                findings = scan_snippet(record.code_before, record.filename)
+                ok = bool(findings)
 
-        if not ok or not findings:
-            skipped_no_bandit += 1
-            if verbose:
-                print(f"  SKIP (no bandit finding): {record.cve_id} {record.filename}")
-            continue
+            if not ok or not findings:
+                skipped_no_bandit += 1
+                if verbose:
+                    print(f"  SKIP (no bandit finding): {record.cve_id} {record.filename}")
+                continue
 
-        # Use the first (highest severity) finding as the training target
-        findings.sort(key=lambda f: (
-            {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(f.severity, 3),
-            {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(f.confidence, 3),
-        ))
-        example = format_instruction_pair(record, findings[0])
-        if example is None:
-            skipped_no_format += 1
-            if verbose:
-                print(f"  SKIP (diff/format mismatch): {record.cve_id} {record.filename}")
-            continue
+            # Use the first (highest severity) finding as the training target
+            findings.sort(key=lambda f: (
+                {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(f.severity, 3),
+                {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(f.confidence, 3),
+            ))
+            example = format_instruction_pair(record, findings[0])
+            if example is None:
+                skipped_no_format += 1
+                if verbose:
+                    print(f"  SKIP (diff/format mismatch): {record.cve_id} {record.filename}")
+                continue
 
         accepted.append(example)
         if verbose or len(accepted) % 100 == 0:
             elapsed = time.time() - t0
             rate = seen / elapsed if elapsed > 0 else 0
+            rule = findings[0].rule_id if not skip_bandit and findings else example["metadata"]["rule_id"]
             print(
                 f"  [{len(accepted):>5} accepted / {seen:>6} seen]  "
-                f"{record.cve_id}  {findings[0].rule_id}  {record.filename}"
+                f"{record.cve_id}  {rule}  {record.filename}"
                 f"  ({rate:.1f} rec/s)"
             )
 
@@ -221,7 +232,8 @@ def run(
     elapsed = time.time() - t0
     print(f"\nDone in {elapsed:.1f}s:")
     print(f"  Candidates seen    : {seen}")
-    print(f"  No Bandit finding  : {skipped_no_bandit}")
+    if not skip_bandit:
+        print(f"  No Bandit finding  : {skipped_no_bandit}")
     print(f"  Diff format mismatch: {skipped_no_format}")
     print(f"  Accepted pairs     : {len(accepted)}")
 
@@ -266,7 +278,9 @@ def main() -> None:
     parser.add_argument("--target",  type=int, default=5000,
                         help="Stop after this many accepted pairs")
     parser.add_argument("--no-gate", action="store_true",
-                        help="Skip Bandit quality gate (faster, noisier)")
+                        help="Skip Bandit quality gate on code_after (still runs on code_before)")
+    parser.add_argument("--skip-bandit", action="store_true",
+                        help="Accept all CVE-fix pairs; skip all Bandit scanning (fastest, noisiest)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -278,6 +292,7 @@ def main() -> None:
         limit=args.limit,
         target=args.target,
         use_gate=not args.no_gate,
+        skip_bandit=args.skip_bandit,
         verbose=args.verbose,
     )
 

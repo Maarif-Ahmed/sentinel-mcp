@@ -100,17 +100,19 @@ class TestPatchGenerator:
         proposal = gen.generate(_make_finding(), _make_context())
         assert proposal.requires_developer_action is True
 
-    def test_llm_error_returns_empty_diff(self, tmp_path: Path):
+    def test_llm_error_returns_comment_marker(self, tmp_path: Path):
+        # A '#'-prefixed marker, not an empty string: generate() keys the
+        # cascade off that prefix, and it tells the developer what failed.
         gen = PatchGenerator(_FakeLLM(LLMProviderError("connection refused")), tmp_path)
         proposal = gen.generate(_make_finding(), None)
-        assert proposal.patch_diff == ""
-        assert "llm error" in proposal.rationale.lower() or "error" in proposal.rationale.lower()
+        assert proposal.patch_diff.startswith("#")
+        assert "connection refused" in proposal.patch_diff
 
-    def test_cannot_patch_signal_returns_empty_diff(self, tmp_path: Path):
+    def test_unparseable_output_returns_comment_marker(self, tmp_path: Path):
         gen = PatchGenerator(_FakeLLM("CANNOT_PATCH"), tmp_path)
         proposal = gen.generate(_make_finding(), None)
-        assert proposal.patch_diff == ""
-        assert "cannot" in proposal.rationale.lower()
+        assert proposal.patch_diff.startswith("#")
+        assert "CANNOT_PATCH" in proposal.patch_diff
 
     def test_valid_diff_returned_as_is(self, tmp_path: Path):
         gen = PatchGenerator(_FakeLLM(_VALID_DIFF), tmp_path)

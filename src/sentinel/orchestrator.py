@@ -66,6 +66,15 @@ class ScanOrchestrator:
         repo_path: Path,
         requested_scanners: list[str] | None = None,
     ) -> list[EnrichedFinding]:
+        """Run the pipeline and return findings sorted by risk score descending."""
+        findings, _errors = self.scan_with_diagnostics(repo_path, requested_scanners)
+        return findings
+
+    def scan_with_diagnostics(
+        self,
+        repo_path: Path,
+        requested_scanners: list[str] | None = None,
+    ) -> tuple[list[EnrichedFinding], list[dict]]:
         """
         Run scanners, normalize, enrich with context, rank.
 
@@ -75,25 +84,39 @@ class ScanOrchestrator:
                                  None means run all available scanners.
 
         Returns:
-            List of EnrichedFinding, sorted by risk score descending.
+            (findings sorted by risk score descending, scanner diagnostics).
+
+        Scanner failures are collected rather than swallowed: a crashed
+        scanner otherwise produces a partial scan that is indistinguishable
+        from a clean one, which silently corrupts any evaluation built on it.
         """
         repo_path = repo_path.resolve()
 
         # --- 1. Run scanners ---
         from sentinel.schemas import RawFinding
         all_raw: list[RawFinding] = []
+        errors: list[dict] = []
         active_scanners = self._select_scanners(requested_scanners)
 
         for scanner in active_scanners:
             if not scanner.is_available():
+                errors.append({"scanner": scanner.name, "status": "unavailable"})
                 continue
             try:
                 raw = scanner.run(repo_path)
                 all_raw.extend(raw)
-            except ScannerNotAvailableError:
-                continue
-            except Exception:
-                continue  # log in production; don't crash the whole scan
+            except ScannerNotAvailableError as e:
+                errors.append(
+                    {"scanner": scanner.name, "status": "unavailable", "detail": str(e)}
+                )
+            except Exception as e:
+                errors.append(
+                    {
+                        "scanner": scanner.name,
+                        "status": "failed",
+                        "detail": f"{type(e).__name__}: {e}",
+                    }
+                )
 
         # --- 2. Normalize and deduplicate ---
         normalizer = FindingNormalizer(repo_path)
@@ -110,9 +133,11 @@ class ScanOrchestrator:
             risk = self._ranker.rank(finding, context)
             enriched.append(EnrichedFinding(finding, context, risk))
 
-        # Sort by risk score descending
-        enriched.sort(key=lambda e: e.risk.score, reverse=True)
-        return enriched
+        # Sort by risk score descending. canonical_id breaks ties so that the
+        # same repository always produces the same ordering — otherwise
+        # Precision@K partly reflects scanner output order.
+        enriched.sort(key=lambda e: (-e.risk.score, e.finding.canonical_id))
+        return enriched, errors
 
     def _select_scanners(
         self, requested: list[str] | None

@@ -76,7 +76,167 @@ def progress(rows: list[dict]) -> None:
     print(f"Annotator 2 done: {len(a2)} / {len(rows)}")
 
 
-def analyse(rows: list[dict], out_dir: Path) -> None:
+def make_blind(rows: list[dict], csv_path: Path, hide: str, fill: str) -> None:
+    """Write a copy with one annotator's columns removed.
+
+    A second annotator who can see the first annotator's answers is not an
+    independent judge, and Cohen's κ over two non-independent columns is
+    meaningless. Stripping them is what makes the agreement statistic real.
+    """
+    out_path = csv_path.parent / f"annotation_blind_{fill}.csv"
+    drop = {f"{hide}_label", f"{hide}_notes", f"{hide}_reviewed"}
+    fields = [f for f in rows[0].keys() if f not in drop]
+
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for r in rows:
+            blank = {k: r.get(k, "") for k in fields}
+            for col in (f"{fill}_label", f"{fill}_notes", f"{fill}_reviewed"):
+                blank[col] = ""
+            writer.writerow(blank)
+
+    print(f"Blind template → {out_path}")
+    print(f"  {hide}'s columns removed; {fill}'s columns blank.")
+    print(f"  {len(rows)} findings to annotate.")
+    print()
+    print("  Hand this file to the second annotator. They run:")
+    print(f"    python -m benchmarks.label --csv {out_path} --annotator {fill[-1]}")
+    print("  Then merge their answers back with:")
+    print(f"    python -m benchmarks.annotate --csv <main csv> --merge-blind {out_path}")
+
+
+def merge_blind(rows: list[dict], csv_path: Path, blind_path: Path) -> None:
+    """Merge a blind annotator's labels back into the main template."""
+    if not blind_path.exists():
+        print(f"[ERROR] {blind_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    with blind_path.open(encoding="utf-8") as f:
+        blind = list(csv.DictReader(f))
+
+    incoming = {
+        (r.get("canonical_id", ""), r.get("rule_id", "")): r for r in blind
+    }
+    fields = list(rows[0].keys())
+    merged = 0
+
+    for row in rows:
+        src = incoming.get((row.get("canonical_id", ""), row.get("rule_id", "")))
+        if src is None:
+            continue
+        for ann in ("annotator1", "annotator2"):
+            label = src.get(f"{ann}_label", "").strip()
+            if not label:
+                continue
+            # Only fill a column the main template has not already answered,
+            # so a merge can never quietly overwrite existing annotation.
+            if row.get(f"{ann}_label", "").strip():
+                continue
+            row[f"{ann}_label"] = label
+            row[f"{ann}_notes"] = src.get(f"{ann}_notes", "")
+            row[f"{ann}_reviewed"] = src.get(f"{ann}_reviewed", "")
+            merged += 1
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Merged {merged} label(s) from {blind_path.name} → {csv_path.name}")
+    print("Run without --merge-blind to compute Cohen's κ.")
+
+
+def analyse_single(
+    rows: list[dict],
+    out_dir: Path,
+    annotator: str,
+    provenance: str = "human_single",
+) -> None:
+    """Emit ground truth from one annotator's labels, without κ.
+
+    Inter-rater agreement is undefined for a single annotator, so it is not
+    reported rather than being computed against a copied column. The output
+    records annotation_mode so the provenance travels with the dataset.
+    """
+    col = f"{annotator}_label"
+    labelled = _labelled_rows(rows, annotator)
+
+    print(f"Annotation mode : {provenance.upper()} ({annotator})")
+    print(f"Labelled        : {len(labelled)} / {len(rows)}")
+    if not labelled:
+        print("[INFO] No labels yet — nothing to write.")
+        return
+
+    counts = Counter(_normalise(r[col]) for r in labelled)
+    print(f"Labels          : tp={counts['tp']}  fp={counts['fp']}  skip={counts['skip']}")
+    print()
+    print("[NOTE] Cohen's κ is not computed: it measures agreement between two")
+    print("       independent annotators and is undefined for one. Report this")
+    print("       dataset as single-annotator and state it as a limitation.")
+
+    if provenance.startswith("ai_"):
+        reviewed = sum(
+            1 for r in labelled
+            if _normalise(r.get(f"{annotator}_reviewed", "")) == "y"
+        )
+        print()
+        if provenance == "ai_draft_reviewed":
+            if reviewed < len(labelled):
+                # Refuse rather than warn: an overstated provenance claim is
+                # worse than no dataset, because it travels into the write-up.
+                print(f"[REFUSED] --provenance ai_draft_reviewed claims human review,")
+                print(f"          but only {reviewed}/{len(labelled)} rows are marked")
+                print(f"          reviewed. Nothing was written.")
+                print(f"          Review them first:")
+                print(f"            python -m benchmarks.label --csv <csv> --review")
+                print(f"          Or record the dataset honestly with:")
+                print(f"            --provenance ai_draft_unreviewed")
+                return
+            print("[PROVENANCE] AI-drafted labels, confirmed row-by-row by a human")
+            print("             reviewer. Still a single annotator, so κ does not")
+            print("             apply and this is not independent annotation.")
+        else:
+            print("[PROVENANCE] These labels were drafted by an AI assistant and have")
+            print("             NOT been reviewed by a human. They are not independent")
+            print("             annotation and must not be reported as such. Review")
+            print("             with: python -m benchmarks.label --csv <csv> --review")
+
+    ground_truth = []
+    for r in labelled:
+        label = _normalise(r[col])
+        ground_truth.append({
+            "canonical_id":     r["canonical_id"],
+            "scanner":          r["scanner"],
+            "rule_id":          r["rule_id"],
+            "cwe_id":           r.get("cwe_id", ""),
+            "file_path":        r["file_path"],
+            "line_start":       r["line_start"],
+            "severity":         r["severity"],
+            "ranked_severity":  r["ranked_severity"],
+            "score":            float(r["score"]),
+            "route_path":       r.get("route_path", ""),
+            "consensus_label":  label,
+            "annotation_mode":  provenance,
+            "annotated_by":     annotator,
+            f"{annotator}_label": label,
+            f"{annotator}_notes": r.get(f"{annotator}_notes", ""),
+        })
+
+    gt_path = out_dir / "ground_truth.json"
+    gt_path.write_text(json.dumps(ground_truth, indent=2), encoding="utf-8")
+    tp_count = sum(1 for g in ground_truth if g["consensus_label"] == "tp")
+    print(f"\nGround truth saved → {gt_path}")
+    print(f"  TP: {tp_count}  FP/skip: {len(ground_truth)-tp_count}")
+
+    if tp_count and len(ground_truth) - tp_count:
+        base = max(tp_count, len(ground_truth) - tp_count) / len(ground_truth)
+        print(f"  Majority-class base rate: {base:.2f}")
+        if base >= 0.9:
+            print("  [WARN] Base rate this high leaves Precision@K little headroom.")
+
+
+def analyse(rows: list[dict], out_dir: Path, provenance: str = "two_human") -> None:
     # Find rows where BOTH annotators have filled a label
     both = [
         r for r in rows
@@ -107,6 +267,13 @@ def analyse(rows: list[dict], out_dir: Path) -> None:
         print("  ✓ PASSED")
     else:
         print(f"  ✗ BELOW TARGET — resolve disagreements first")
+
+    if provenance == "ai_plus_human":
+        print()
+        print("[PROVENANCE] annotator1 is an AI draft; annotator2 is an independent")
+        print("             human. This κ measures AI–human agreement, NOT agreement")
+        print("             between two independent human annotators. Say so wherever")
+        print("             the figure is reported.")
 
     # Disagreements
     disagreements = [r for r, l1, l2 in zip(both, labels1, labels2) if l1 != l2]
@@ -147,6 +314,8 @@ def analyse(rows: list[dict], out_dir: Path) -> None:
                 "score":           float(r["score"]),
                 "route_path":      r.get("route_path", ""),
                 "consensus_label": consensus,
+                "annotation_mode": provenance,
+                "cohens_kappa":    round(kappa, 4),
                 "annotator1_label": l1,
                 "annotator2_label": l2,
                 "annotator1_notes": r.get("annotator1_notes", ""),
@@ -169,6 +338,22 @@ def main() -> None:
                    help="Path to filled annotation_template.csv")
     p.add_argument("--progress", action="store_true",
                    help="Show completion progress only (no κ calculation)")
+    p.add_argument("--single-annotator", metavar="N", nargs="?", const="1",
+                   choices=["1", "2"],
+                   help="Build ground truth from one annotator's labels. "
+                        "Cohen's κ is not reported — it is undefined for a "
+                        "single annotator.")
+    p.add_argument("--provenance", default="human_single",
+                   choices=["human_single", "ai_draft_unreviewed", "ai_draft_reviewed",
+                            "two_human", "ai_plus_human"],
+                   help="How the labels were produced. Recorded in every "
+                        "ground-truth row so the origin travels with the data.")
+    p.add_argument("--make-blind", metavar="FILL", nargs="?", const="annotator2",
+                   choices=["annotator1", "annotator2"],
+                   help="Write a copy with the OTHER annotator's columns removed, "
+                        "so this one can judge independently.")
+    p.add_argument("--merge-blind", metavar="CSV", default=None,
+                   help="Merge a completed blind template back into this one.")
     args = p.parse_args()
 
     csv_path = Path(args.csv)
@@ -181,8 +366,20 @@ def main() -> None:
 
     if args.progress:
         progress(rows)
+    elif args.make_blind:
+        fill = args.make_blind
+        hide = "annotator1" if fill == "annotator2" else "annotator2"
+        make_blind(rows, csv_path, hide, fill)
+    elif args.merge_blind:
+        merge_blind(rows, csv_path, Path(args.merge_blind))
+    elif args.single_annotator:
+        analyse_single(rows, out_dir, f"annotator{args.single_annotator}",
+                       args.provenance)
     else:
-        analyse(rows, out_dir)
+        mode = args.provenance
+        if mode not in ("two_human", "ai_plus_human"):
+            mode = "two_human"
+        analyse(rows, out_dir, mode)
 
 
 if __name__ == "__main__":

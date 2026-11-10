@@ -49,3 +49,13 @@ trivy-cache/
 
 # Node (for vulnerable-apps)
 node_modules/
+
+# Fine-tuned LoRA adapters — distributed via the Hugging Face Hub.
+# adapter_model.safetensors is 120 MB, past GitHub's 100 MB file limit.
+models/
+
+# Generated report output
+sentinel-report/
+
+# Scratch fixture at the repo root; belongs under vulnerable-apps/ if kept
+testing.py

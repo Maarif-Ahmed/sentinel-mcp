@@ -158,7 +158,12 @@ class PatchGenerator:
                     finding, context_block, fb_desc, fallback_llm
                 )
                 if not fb_diff.startswith("#"):
-                    fb_conf = self._router._structural_score(fb_diff, finding)
+                    # Score the fallback the same way as the primary. Comparing
+                    # a structural-only score against a blended one lets a
+                    # weaker patch win on scale difference alone.
+                    fb_conf = self._router.confidence_score(
+                        fb_diff, finding, fallback_llm
+                    )
                     if fb_conf > confidence:
                         patch_diff, generated_by, confidence = fb_diff, fb_model, fb_conf
 

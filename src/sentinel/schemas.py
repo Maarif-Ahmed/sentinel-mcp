@@ -61,11 +61,31 @@ class SecurityFinding(BaseModel):
     message: str
     snippet: str | None = None  # ≤10 lines of surrounding source context
     is_dev_dependency: bool = False  # True when finding is in a dev/test dep (Trivy npm)
+    # Other scanners that independently reported this same canonical_id.
+    # Independent agreement is a true-positive signal, so it is kept rather
+    # than discarded when duplicates are merged.
+    corroborated_by: list[str] = Field(default_factory=list)
 
     @staticmethod
     def make_canonical_id(posix_path: str, line_start: int, cwe_or_rule: str) -> str:
         raw = f"{posix_path}:{line_start}:{cwe_or_rule}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def make_fingerprint(posix_path: str, cwe_or_rule: str) -> str:
+        raw = f"{posix_path}:{cwe_or_rule}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    @property
+    def fingerprint(self) -> str:
+        """Line-independent identity: same file + same rule/CWE.
+
+        canonical_id pins a finding to a line, so any patch that inserts or
+        removes lines above it changes the id even when the vulnerability is
+        untouched. Rescan comparisons use this instead, otherwise a line shift
+        reads as a successful fix.
+        """
+        return self.make_fingerprint(self.file_path, self.cwe_id or self.rule_id)
 
 
 # ---------------------------------------------------------------------------

@@ -51,6 +51,8 @@ class PairRecord:
 # ---------------------------------------------------------------------------
 
 _PYTHON_EXTENSIONS = {".py"}
+_JS_EXTENSIONS = {".js", ".mjs", ".cjs", ".ts", ".tsx"}
+_SUPPORTED_EXTENSIONS = _PYTHON_EXTENSIONS | _JS_EXTENSIONS
 
 # CWEs that Bandit can reliably detect — used to prioritise, not to hard-filter
 BANDIT_DETECTABLE_CWES = {
@@ -73,6 +75,17 @@ MIN_CODE_CHARS = 50   # skip trivial stubs
 
 def _is_python(filename: str) -> bool:
     return Path(filename).suffix.lower() in _PYTHON_EXTENSIONS
+
+
+def _is_supported(filename: str) -> bool:
+    return Path(filename).suffix.lower() in _SUPPORTED_EXTENSIONS
+
+
+def _lang_from_filename(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext in _JS_EXTENSIONS:
+        return "javascript"
+    return "python"
 
 
 def _diff_line_count(diff: str) -> int:
@@ -168,6 +181,26 @@ def load_from_sqlite(db_path: Path, limit: int = 0) -> Iterator[PairRecord]:
 # HuggingFace loader
 # ---------------------------------------------------------------------------
 
+def _extract_code_fence(text: str) -> str:
+    """Return the first ```python...``` block from a string, or '' if none found."""
+    import re
+    m = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL)
+    return m.group(1).rstrip() if m else ""
+
+
+def _generate_diff(code_before: str, code_after: str, filename: str) -> str:
+    """Generate a unified diff between two code strings when no diff is provided."""
+    import difflib
+    before_lines = code_before.splitlines(keepends=True)
+    after_lines  = code_after.splitlines(keepends=True)
+    diff_lines = list(difflib.unified_diff(
+        before_lines, after_lines,
+        fromfile=f"a/{filename}", tofile=f"b/{filename}",
+        lineterm="",
+    ))
+    return "".join(diff_lines)
+
+
 def load_from_huggingface(
     dataset_name: str = "bstee615/cvefixes",
     split: str = "train",
@@ -192,32 +225,82 @@ def load_from_huggingface(
 
     ds = load_dataset(dataset_name, split=split, streaming=True)
     count = 0
-    for row in ds:
+    _iter = iter(ds)
+    while True:
+        try:
+            row = next(_iter)
+        except StopIteration:
+            break
+        except Exception as e:
+            import sys
+            print(f"Warning: skipping unreadable dataset shard ({type(e).__name__}: {e})", file=sys.stderr)
+            continue
         if limit and count >= limit:
             break
+
+        # --- SecuCoder schema (messages-based fix tasks) —— checked first ---
+        messages = row.get("messages")
+        meta = row.get("meta") or {}
+        if isinstance(messages, list) and len(messages) >= 3 and isinstance(meta, dict):
+            if meta.get("task") != "fix":
+                continue
+            if meta.get("language", "").lower() not in ("python", "py"):
+                continue
+            user_content = messages[1].get("content", "") if isinstance(messages[1], dict) else ""
+            asst_content = messages[2].get("content", "") if isinstance(messages[2], dict) else ""
+            code_before = _extract_code_fence(user_content)
+            code_after  = _extract_code_fence(asst_content)
+            if not code_before or not code_after:
+                continue
+            cwe_list = meta.get("cwe") or []
+            cwe_id = cwe_list[0] if cwe_list else None
+            idx_str = str(row.get("id", count))
+            diff = _generate_diff(code_before, code_after, f"securecoder_{idx_str}.py")
+            rec = PairRecord(
+                cve_id=f"SECURECODER-{idx_str}",
+                cwe_id=cwe_id,
+                filename=f"securecoder_{idx_str}.py",
+                code_before=code_before,
+                code_after=code_after,
+                diff=diff,
+                commit_message="",
+                repo_url="",
+            )
+            if _record_ok(rec):
+                yield rec
+                count += 1
+            continue
 
         # --- Schema normalisation ---
         # hitoshura25/cvefixes: file_paths is a list; code fields use different names
         file_paths = row.get("file_paths")
+        lang_field = (row.get("language") or row.get("language_dir") or "").lower()
+        is_python_lang = lang_field in ("python", "py")
+        is_js_lang = lang_field in ("javascript", "js", "typescript", "ts")
+        is_supported_lang = is_python_lang or is_js_lang
+
         if isinstance(file_paths, list):
-            # Pick first Python file from the list; skip row if none
-            py_files = [f for f in file_paths if _is_python(f)]
-            if not py_files:
+            # Pick first supported file from the list; skip row if none
+            sup_files = [f for f in file_paths if _is_supported(f)]
+            if not sup_files:
                 continue
-            filename = py_files[0]
-            # Filter: row-level language field must be Python too
-            if row.get("language", "").lower() not in ("python", ""):
+            filename = sup_files[0]
+            # Filter: row-level language field must match a supported language
+            if row.get("language", "").lower() not in ("python", "javascript", "typescript", ""):
                 continue
         else:
             filename = row.get("filename") or row.get("file_name") or ""
-            if not _is_python(filename):
+            # Accept row if filename is a supported extension OR language field matches
+            if not _is_supported(filename) and not is_supported_lang:
                 continue
+            # For rows with no real filename, synthesise one
+            if not filename and is_python_lang:
+                pair_id = row.get("file_pair_id") or str(count)
+                filename = f"crossvul_{pair_id}.py"
+            elif not filename and is_js_lang:
+                pair_id = row.get("file_pair_id") or str(count)
+                filename = f"crossvul_{pair_id}.js"
 
-        diff = (
-            row.get("diff_with_context")
-            or row.get("diff")
-            or ""
-        )
         code_before = (
             row.get("code_before")
             or row.get("before")
@@ -230,10 +313,26 @@ def load_from_huggingface(
             or row.get("fixed_code")
             or ""
         )
+        diff = (
+            row.get("diff_with_context")
+            or row.get("diff")
+            or ""
+        )
+        # CrossVul and similar datasets have no diff field — generate one
+        if not diff and code_before and code_after:
+            diff = _generate_diff(code_before, code_after, filename or "file.py")
+
+        # CrossVul has no CVE ID; use file_pair_id as a stable identifier
+        cve_id = (
+            row.get("cve_id") or row.get("CVE_ID")
+            or (f"CROSSVUL-{row['file_pair_id']}" if row.get("file_pair_id") else None)
+            or "UNKNOWN"
+        )
+
         rec = PairRecord(
-            cve_id=row.get("cve_id") or row.get("CVE_ID") or "UNKNOWN",
+            cve_id=cve_id,
             cwe_id=row.get("cwe_id") or row.get("CWE_ID"),
-            filename=filename,
+            filename=filename or f"file_{count}.py",
             code_before=code_before,
             code_after=code_after,
             diff=diff,

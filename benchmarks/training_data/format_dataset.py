@@ -29,7 +29,7 @@ import json
 import re
 from pathlib import Path
 
-from benchmarks.training_data.extract import PairRecord
+from benchmarks.training_data.extract import PairRecord, _lang_from_filename
 from benchmarks.training_data.scan import BanditFinding
 
 
@@ -84,6 +84,52 @@ def _clean_diff(diff: str) -> str:
         if m:
             cleaned = cleaned[m.start():]
     return cleaned
+
+
+def format_cve_pair(record: PairRecord) -> dict | None:
+    """
+    Build one training example from a CVE-fix pair with no Bandit finding.
+    Used when --skip-bandit is active. Validates diff format only.
+    """
+    diff = _clean_diff(record.diff)
+    if not diff.startswith("---"):
+        return None
+
+    lang = _lang_from_filename(record.filename)
+    user_content = (
+        f"CVE: {record.cve_id}"
+        + (f"  CWE: {record.cwe_id}" if record.cwe_id else "")
+        + f"\nFile: {record.filename}\n"
+        + (f"Description: {record.commit_message}\n\n" if record.commit_message else "\n")
+        + f"Vulnerable code (before fix):\n```{lang}\n{record.code_before}\n```\n\n"
+        + f"Generate the unified diff that applies the security fix.\n"
+        + f"The diff header must be:\n"
+        + f"--- a/{record.filename}\n"
+        + f"+++ b/{record.filename}"
+    )
+
+    pair_id = hashlib.sha256(
+        f"{record.cve_id}{record.filename}".encode()
+    ).hexdigest()[:12]
+
+    return {
+        "id": f"{record.cve_id}-{pair_id}",
+        "messages": [
+            {"role": "system",    "content": _SYSTEM_PATCH},
+            {"role": "user",      "content": user_content},
+            {"role": "assistant", "content": diff},
+        ],
+        "metadata": {
+            "cve_id":      record.cve_id,
+            "cwe_id":      record.cwe_id or "",
+            "rule_id":     "NONE",
+            "severity":    "UNKNOWN",
+            "confidence":  "UNKNOWN",
+            "diff_lines":  record.diff_size,
+            "filename":    record.filename,
+            "repo_url":    record.repo_url,
+        },
+    }
 
 
 def format_instruction_pair(

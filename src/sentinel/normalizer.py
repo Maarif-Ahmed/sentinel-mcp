@@ -32,6 +32,17 @@ _SEVERITY_NORMALIZE: dict[str, str] = {
     "error": "high",
 }
 
+# Confidence has its own vocabulary — reusing the severity map let values
+# like "info" or "critical" through before being coerced.
+_CONFIDENCE_NORMALIZE: dict[str, str] = {
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+    "definite": "high",
+    "firm": "medium",
+    "tentative": "low",
+}
+
 
 class FindingNormalizer:
     def __init__(self, repo_root: Path, snippet_context_lines: int = 5) -> None:
@@ -44,26 +55,54 @@ class FindingNormalizer:
 
         Returns findings sorted by severity (critical → info) then confidence.
         """
-        # canonical_id → best finding seen so far
-        seen: dict[str, SecurityFinding] = {}
+        # (canonical_id, scanner, rule_id) → best finding for that exact rule.
+        # canonical_id alone is file+line+CWE, so two DIFFERENT rules from one
+        # scanner hash identically — B602 (shell=True) and B607 (partial path)
+        # fire on the same call and need different fixes. Keying on rule_id as
+        # well stops one of them being silently discarded.
+        buckets: dict[tuple[str, str, str], SecurityFinding] = {}
 
         for raw in raw_findings:
             finding = self._to_security_finding(raw)
             if finding is None:
                 continue
+            key = (finding.canonical_id, finding.scanner, finding.rule_id)
+            existing = buckets.get(key)
+            if existing is None or (
+                _CONFIDENCE_RANK.get(finding.confidence, 0)
+                > _CONFIDENCE_RANK.get(existing.confidence, 0)
+            ):
+                buckets[key] = finding
 
-            existing = seen.get(finding.canonical_id)
-            if existing is None:
-                seen[finding.canonical_id] = finding
-            else:
-                # Keep the higher-confidence finding
-                if (
-                    _CONFIDENCE_RANK.get(finding.confidence, 0)
-                    > _CONFIDENCE_RANK.get(existing.confidence, 0)
-                ):
-                    seen[finding.canonical_id] = finding
+        # Cross-scanner agreement is still collapsed: when two scanners report
+        # the same location, the developer should see it once, with the
+        # agreement recorded rather than thrown away.
+        by_location: dict[str, list[SecurityFinding]] = {}
+        for finding in buckets.values():
+            by_location.setdefault(finding.canonical_id, []).append(finding)
 
-        return _sort_findings(list(seen.values()))
+        out: list[SecurityFinding] = []
+        for group in by_location.values():
+            scanners = {f.scanner for f in group}
+            if len(scanners) == 1:
+                out.extend(group)
+                continue
+
+            def _best_confidence(scanner: str) -> int:
+                return max(
+                    _CONFIDENCE_RANK.get(f.confidence, 0)
+                    for f in group
+                    if f.scanner == scanner
+                )
+
+            primary = max(sorted(scanners), key=_best_confidence)
+            others = sorted(scanners - {primary})
+            for finding in group:
+                if finding.scanner == primary:
+                    finding.corroborated_by = others
+                    out.append(finding)
+
+        return _sort_findings(out)
 
     def _to_security_finding(self, raw: RawFinding) -> SecurityFinding | None:
         posix_path = self._to_posix_relative(raw.file_path)
@@ -71,10 +110,7 @@ class FindingNormalizer:
             return None  # path escapes repo root — skip
 
         severity = _SEVERITY_NORMALIZE.get(raw.severity.lower(), "low")
-        confidence = _SEVERITY_NORMALIZE.get(raw.confidence.lower(), "low")
-        # Confidence values reuse the same set of strings
-        if confidence not in ("high", "medium", "low"):
-            confidence = "low"
+        confidence = _CONFIDENCE_NORMALIZE.get(raw.confidence.lower(), "low")
 
         cwe_or_rule = raw.cwe_id or raw.rule_id
         canonical_id = SecurityFinding.make_canonical_id(
@@ -124,6 +160,10 @@ class FindingNormalizer:
         """
         try:
             p = Path(abs_path_str)
+            if not p.is_absolute():
+                # Scanners that emit repo-relative paths would otherwise be
+                # resolved against the process CWD and silently yield None.
+                p = self._repo_root / p
             if not p.is_file():
                 return None
             lines = p.read_text(encoding="utf-8", errors="replace").splitlines()

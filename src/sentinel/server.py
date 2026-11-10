@@ -13,6 +13,7 @@ restarts — the audit log is the durable record.
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,13 +86,13 @@ def _get_audit_logger():
 
 
 def _log(event_type: str, repo_root: str, action: str, outcome: str,
-         finding_canon_id: str | None = None, **meta) -> None:
+         finding_canonical_id: str | None = None, **meta) -> None:
     from sentinel.schemas import AuditEvent
     try:
         _get_audit_logger().log(AuditEvent(
             event_type=event_type,
             repository_root=repo_root,
-            finding_canonical_id=finding_canon_id,
+            finding_canonical_id=finding_canonical_id,
             action=action,
             outcome=outcome,
             metadata=meta,
@@ -154,9 +155,13 @@ def scan_repository(
 
     try:
         orchestrator = _get_orchestrator()
-        enriched = orchestrator.scan(resolved, scanners)
+        enriched, scan_errors = orchestrator.scan_with_diagnostics(resolved, scanners)
 
-        # Cache for later tool calls
+        # Cache for later tool calls. Evict the previous scan's findings for
+        # this repo first — stale ids otherwise stay resolvable by propose_fix
+        # and point at line numbers the file no longer has.
+        for stale in _scan_results.get(scan_id, []):
+            _findings_by_id.pop(stale.finding.id, None)
         _scan_results[scan_id] = enriched
         for ef in enriched:
             _findings_by_id[ef.finding.id] = ef
@@ -164,14 +169,19 @@ def scan_repository(
         results = [ef.to_dict() for ef in enriched]
 
         summary = _build_summary(enriched)
-        _log("scan_repository", str(resolved), "scan", "success",
-             scanner_count=len(enriched), scanners_requested=scanners)
+        failed = [e for e in scan_errors if e["status"] == "failed"]
+        _log("scan_repository", str(resolved), "scan",
+             "partial" if failed else "success",
+             finding_count=len(enriched), scanners_requested=scanners,
+             scanner_errors=scan_errors)
 
         return {
             "scan_id": scan_id,
             "findings": results,
             "summary": summary,
             "finding_count": len(results),
+            "scanner_status": scan_errors,
+            "complete": not failed,
         }
     except Exception as e:
         _log("scan_repository", str(resolved), "scan", "error", error=str(e))
@@ -407,6 +417,9 @@ def report(repo_path: str, output_path: str | None = None) -> dict:
     gen = ReportGenerator()
     json_path, html_path = gen.write(enriched, events, out_dir)
 
+    _log("report", str(resolved), "report", "success",
+         finding_count=len(enriched), output_dir=str(out_dir))
+
     return {
         "json_path": str(json_path),
         "html_path": str(html_path),
@@ -561,6 +574,24 @@ def stop_watch(repo_path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _allowed_roots() -> list[Path]:
+    """Directories under which a repository may be scanned.
+
+    Configured via SENTINEL_ALLOWED_ROOTS (os.pathsep-separated absolute
+    paths). Defaults to the user's home directory so that system locations
+    and other users' data are out of reach without explicit opt-in.
+    """
+    raw = os.environ.get("SENTINEL_ALLOWED_ROOTS", "").strip()
+    if not raw:
+        return [Path.home().resolve()]
+    roots = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if part:
+            roots.append(Path(part).expanduser().resolve())
+    return roots or [Path.home().resolve()]
+
+
 def _validate_repo_path(repo_path: str) -> Path:
     p = Path(repo_path)
     if not p.is_absolute():
@@ -569,7 +600,18 @@ def _validate_repo_path(repo_path: str) -> Path:
         raise ValueError(f"repo_path does not exist: {repo_path!r}")
     if not p.is_dir():
         raise ValueError(f"repo_path must be a directory: {repo_path!r}")
-    return p.resolve()
+
+    # resolve() collapses symlinks and '..', so confinement cannot be escaped
+    # by a crafted path that points outside an allowed root.
+    resolved = p.resolve()
+    roots = _allowed_roots()
+    if not any(resolved == r or r in resolved.parents for r in roots):
+        raise ValueError(
+            f"repo_path is outside the allowed roots: {repo_path!r}. "
+            f"Allowed: {[str(r) for r in roots]}. "
+            "Set SENTINEL_ALLOWED_ROOTS to permit another location."
+        )
+    return resolved
 
 
 def _build_summary(enriched: list) -> dict:

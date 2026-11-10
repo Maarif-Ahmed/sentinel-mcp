@@ -4,12 +4,17 @@ Verification engine — syntax check + rescan after developer applies a patch.
 Two stages:
   1. SyntaxChecker: validates that the patched file parses without errors
      (Python: ast.parse; JS/TS: 'node --check' subprocess if Node is available)
-  2. RescanEngine: runs the original scanner on the patched file and checks
-     whether the finding's canonical_id is absent from the results
+  2. RescanEngine: re-runs the original scanner and reports whether an
+     equivalent finding is still present
 
-IMPORTANT: rescan_clear=True means the scanner no longer reports this
-canonical_id. It does NOT prove the vulnerability is fixed. The scanner
-may have missed it, or the fix may be incomplete. Manual review is required.
+IMPORTANT: a CLEAR outcome means the scanner no longer reports this finding.
+It does NOT prove the vulnerability is fixed. The scanner may have missed it,
+or the fix may be incomplete. Manual review is required.
+
+Matching uses SecurityFinding.fingerprint (file + rule/CWE), not canonical_id
+(which pins the finding to a line number). A patch that inserts or removes
+lines shifts every line below it, so canonical_id comparison would report an
+untouched vulnerability as fixed.
 """
 
 from __future__ import annotations
@@ -17,11 +22,24 @@ from __future__ import annotations
 import ast
 import shutil
 import subprocess
+from enum import Enum
 from pathlib import Path
 
 from sentinel.normalizer import FindingNormalizer
 from sentinel.scanners.bandit import BanditAdapter
 from sentinel.schemas import SecurityFinding, VerificationResult
+
+
+class RescanOutcome(str, Enum):
+    """Tri-state rescan result.
+
+    INCONCLUSIVE is distinct from CLEAR on purpose: a scanner that could not
+    run tells us nothing, and must never be reported as a successful fix.
+    """
+
+    CLEAR = "clear"
+    STILL_PRESENT = "still_present"
+    INCONCLUSIVE = "inconclusive"
 
 
 class SyntaxChecker:
@@ -78,45 +96,47 @@ class RescanEngine:
         self._normalizer = FindingNormalizer(repo_root)
         self._bandit = BanditAdapter()
 
-    def rescan(self, original_finding: SecurityFinding) -> tuple[bool, str]:
-        """
-        Rescan for the original finding's canonical_id.
-
-        Returns:
-            (rescan_clear: bool, message: str)
-            rescan_clear=True → canonical_id absent in rescan
-            rescan_clear=False → canonical_id still present
-        """
+    def rescan(self, original_finding: SecurityFinding) -> tuple[RescanOutcome, str]:
+        """Rescan and report whether an equivalent finding is still present."""
         scanner = original_finding.scanner
 
         if scanner == "bandit":
             return self._rescan_with_bandit(original_finding)
 
-        # Trivy rescans the whole filesystem; for now we report inconclusive
-        # rather than running a full Trivy scan on every verify call.
-        return True, (
-            f"Rescan for scanner '{scanner}' not implemented — "
-            "result is inconclusive. Manual verification required."
+        return RescanOutcome.INCONCLUSIVE, (
+            f"Rescan for scanner '{scanner}' is not implemented. "
+            "Manual verification required."
         )
 
-    def _rescan_with_bandit(self, finding: SecurityFinding) -> tuple[bool, str]:
-        target_file = self._repo_root / finding.file_path.replace("/", "\\")
+    def _rescan_with_bandit(
+        self, finding: SecurityFinding
+    ) -> tuple[RescanOutcome, str]:
+        target_file = self._repo_root / finding.file_path
         if not target_file.is_file():
-            return True, f"File no longer exists: {finding.file_path}"
+            # The file vanishing is not evidence of a fix — it may have been
+            # moved, renamed, or the wrong repo_path was supplied.
+            return RescanOutcome.INCONCLUSIVE, (
+                f"File not found: {finding.file_path}. Cannot verify."
+            )
+
+        if not self._bandit.is_available():
+            return RescanOutcome.INCONCLUSIVE, "bandit is not available — rescan skipped"
 
         try:
-            if not self._bandit.is_available():
-                return True, "bandit not available — rescan skipped (inconclusive)"
-
             raw_findings = self._bandit.run(target_file.parent)
             normalized = self._normalizer.normalize(raw_findings)
-            found_ids = {f.canonical_id for f in normalized}
-            clear = finding.canonical_id not in found_ids
-            if clear:
-                return True, f"canonical_id {finding.canonical_id[:8]}… absent in rescan"
-            return False, f"canonical_id {finding.canonical_id[:8]}… still present in rescan"
         except Exception as e:
-            return True, f"Rescan error: {e} — result is inconclusive"
+            return RescanOutcome.INCONCLUSIVE, f"Rescan failed: {e}"
+
+        fingerprints = {f.fingerprint for f in normalized}
+        if finding.fingerprint in fingerprints:
+            return RescanOutcome.STILL_PRESENT, (
+                f"An equivalent finding ({finding.rule_id} in {finding.file_path}) "
+                "is still reported after the patch."
+            )
+        return RescanOutcome.CLEAR, (
+            f"No {finding.rule_id} finding remains in {finding.file_path}."
+        )
 
 
 class VerificationPipeline:
@@ -130,10 +150,10 @@ class VerificationPipeline:
     def verify(
         self, proposal_id: str, finding: SecurityFinding
     ) -> VerificationResult:
-        file_path = self._repo_root / finding.file_path.replace("/", "\\")
+        file_path = self._repo_root / finding.file_path
 
         # Stage 1: syntax check
-        syntax_ok, syntax_msg = self._syntax_checker.check(file_path)
+        syntax_ok, _syntax_msg = self._syntax_checker.check(file_path)
         if not syntax_ok:
             return VerificationResult(
                 proposal_id=proposal_id,
@@ -143,18 +163,17 @@ class VerificationPipeline:
             )
 
         # Stage 2: rescan
-        rescan_clear, rescan_msg = self._rescan_engine.rescan(finding)
+        outcome, _rescan_msg = self._rescan_engine.rescan(finding)
 
-        if "inconclusive" in rescan_msg.lower():
-            overall = "inconclusive"
-        elif rescan_clear:
-            overall = "undetected_by_rescan"
-        else:
-            overall = "still_detected"
+        overall = {
+            RescanOutcome.CLEAR: "undetected_by_rescan",
+            RescanOutcome.STILL_PRESENT: "still_detected",
+            RescanOutcome.INCONCLUSIVE: "inconclusive",
+        }[outcome]
 
         return VerificationResult(
             proposal_id=proposal_id,
             syntax_ok=syntax_ok,
-            rescan_clear=rescan_clear,
+            rescan_clear=outcome is RescanOutcome.CLEAR,
             overall=overall,  # type: ignore[arg-type]
         )

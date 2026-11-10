@@ -110,10 +110,30 @@ def run(repo: Path, out_dir: Path, scanner_names: list[str]) -> Path:
         # Annotator 1 (e.g. M4 / Shaheer)
         "annotator1_label",   # tp | fp | skip
         "annotator1_notes",
+        "annotator1_reviewed",
         # Annotator 2 (e.g. M3 / Marif)
         "annotator2_label",   # tp | fp | skip
         "annotator2_notes",
+        "annotator2_reviewed",
     ]
+    _ANNOTATION_FIELDS = [f for f in _FIELDS if f.startswith("annotator")]
+
+    # Carry over any labels already recorded. Rewriting the template blank on
+    # every scan silently destroys the annotation work, which is the most
+    # expensive thing in the whole evaluation.
+    existing: dict[tuple[str, str], dict] = {}
+    if csv_path.exists():
+        with csv_path.open(encoding="utf-8") as f:
+            for old in csv.DictReader(f):
+                key = (old.get("canonical_id", ""), old.get("rule_id", ""))
+                kept = {
+                    k: old.get(k, "") for k in _ANNOTATION_FIELDS
+                    if old.get(k, "").strip()
+                }
+                if kept:
+                    existing[key] = kept
+    if existing:
+        print(f"Carrying over labels for {len(existing)} previously annotated finding(s)")
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=_FIELDS)
@@ -122,7 +142,8 @@ def run(repo: Path, out_dir: Path, scanner_names: list[str]) -> Path:
             fi = ef.finding
             ri = ef.risk
             ct = ef.context
-            w.writerow({
+            carried = existing.get((fi.canonical_id, fi.rule_id), {})
+            row = {
                 "canonical_id":     fi.canonical_id,
                 "scanner":          fi.scanner,
                 "rule_id":          fi.rule_id,
@@ -138,11 +159,10 @@ def run(repo: Path, out_dir: Path, scanner_names: list[str]) -> Path:
                 "http_methods":     "|".join(ct.http_methods),
                 "middleware_names":  "|".join(ct.middleware_names),
                 "message":          fi.message,
-                "annotator1_label":  "",
-                "annotator1_notes":  "",
-                "annotator2_label":  "",
-                "annotator2_notes":  "",
-            })
+                **{k: "" for k in _ANNOTATION_FIELDS},
+                **carried,
+            }
+            w.writerow(row)
 
     print(f"Annotation template → {csv_path}")
 

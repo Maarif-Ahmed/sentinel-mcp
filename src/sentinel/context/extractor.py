@@ -30,6 +30,10 @@ class RouteInfo:
     handler_file: str        # POSIX path of the handler file
     handler_name: str        # function name or "<anonymous>"
     middleware_names: list[str] = field(default_factory=list)
+    # 1-indexed inclusive line span of the handler body, when the extractor
+    # can determine it. Without this a finding is attributed to an arbitrary
+    # route in the same file rather than the one it actually sits inside.
+    handler_lines: tuple[int, int] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +54,19 @@ try:
 except Exception:
     pass
 
-# Express HTTP method names we recognise as route registrations
-_EXPRESS_METHODS = {"get", "post", "put", "patch", "delete", "all", "use"}
+# Express HTTP method names we recognise as route registrations.
+# 'use' is deliberately excluded: app.use('/assets', ...) mounts middleware or
+# a sub-app, it does not register a request handler. Treating it as a route
+# produced attributions like '/assets/public/images/padding'.
+_EXPRESS_METHODS = {"get", "post", "put", "patch", "delete", "all"}
+
+# The receiver of a route call must look like an Express app or router,
+# otherwise unrelated calls such as cache.get("/key") are picked up as routes.
+_ROUTER_OBJECT_RE = re.compile(r"(^|\.)(app|router)s?$", re.IGNORECASE)
+
+
+def _is_router_object(text: str) -> bool:
+    return bool(_ROUTER_OBJECT_RE.search(text.strip())) or "router" in text.lower()
 
 # tree-sitter 0.26 API: Query + QueryCursor.matches() returns
 # list of (pattern_index, dict[capture_name, list[Node]]) per match.
@@ -59,6 +74,7 @@ _EXPRESS_METHODS = {"get", "post", "put", "patch", "delete", "all", "use"}
 _ROUTE_QUERY_PATTERN = """
 (call_expression
   function: (member_expression
+    object: (_) @object
     property: (property_identifier) @method)
   arguments: (arguments
     . (string) @route_path))
@@ -85,12 +101,21 @@ class TreeSitterExtractor:
         for _pattern_idx, cap_dict in matches:
             method_nodes = cap_dict.get("method", [])
             path_nodes = cap_dict.get("route_path", [])
+            object_nodes = cap_dict.get("object", [])
 
             if not method_nodes or not path_nodes:
                 continue
 
             method = method_nodes[0].text.decode() if method_nodes[0].text else ""
             if method.lower() not in _EXPRESS_METHODS:
+                continue
+
+            obj_text = (
+                object_nodes[0].text.decode()
+                if object_nodes and object_nodes[0].text
+                else ""
+            )
+            if not _is_router_object(obj_text):
                 continue
 
             raw_path = path_nodes[0].text.decode() if path_nodes[0].text else ""
@@ -161,8 +186,8 @@ class TreeSitterExtractor:
 # Group 4: presence of a trailing arrow/function expression (=> or function keyword)
 _ROUTE_RE = re.compile(
     r"""
-    (?:app|router)\s*\.\s*
-    (get|post|put|patch|delete|all|use)\s*\(
+    (?:\w*(?:app|router)s?)\s*\.\s*
+    (get|post|put|patch|delete|all)\s*\(
     \s*['"`]([^'"`]+)['"`]\s*     # route path
     ((?:\s*,\s*\w+)*)             # optional identifier args (middleware + named handler)
     (?:\s*,\s*(?:\(|function\b|async\s+(?:\(|function\b)))?  # trailing arrow/function?

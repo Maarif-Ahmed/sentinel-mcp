@@ -41,11 +41,26 @@ _HIGH_IMPACT_CWES = {
     "CWE-306",  # Missing Authentication
 }
 
-# Heuristic: middleware names that suggest authentication enforcement
+# Heuristic: middleware names that suggest authentication enforcement.
+# Bare 'session' is excluded — express-session provides session *storage*,
+# not authentication, and matching it suppressed the exposure bonus on
+# genuinely unauthenticated routes.
 _AUTH_MIDDLEWARE_HINTS = {
+    # Express / JavaScript naming
     "auth", "authenticate", "authenticated", "isauth", "isloggedin",
     "requireauth", "requirelogin", "verifytoken", "checkauth",
-    "passport", "jwt", "session",
+    "passport", "jwt",
+    "requiresession", "checksession", "validatesession",
+    # Flask / FastAPI decorator naming. These are snake_case and read in the
+    # opposite order to the camelCase forms above, so 'requirelogin' does not
+    # match 'login_required' and they have to be listed separately.
+    "login_required", "token_required", "admin_required",
+    "requires_role", "roles_required", "role_required",
+    "permission_required", "permissions_required",
+    # FastAPI dependency names — these arrive via Depends() rather than as
+    # decorators, but occupy the same guard position.
+    "current_user", "active_user", "verify_token", "verify_api_key",
+    "require_admin", "require_scope", "oauth2", "api_key", "bearer",
 }
 
 
@@ -112,10 +127,27 @@ class RuleBasedRanker(RankerProvider):
         dep_bonus = 1.0 if finding.scanner == "trivy" else 0.0
         breakdown["dependency_bonus"] = dep_bonus
 
-        raw_score = sev + conf + cwe_w + exposure_bonus - auth_penalty + dep_bonus
+        # Independent agreement between scanners
+        corroboration = 1.0 if finding.corroborated_by else 0.0
+        breakdown["corroboration_bonus"] = corroboration
 
-        # Normalise to 0.0–1.0; max possible = 4+2+2+2+0+1 = 11
-        score = min(raw_score / 11.0, 1.0)
+        raw_score = (
+            sev + conf + cwe_w + exposure_bonus - auth_penalty
+            + dep_bonus + corroboration
+        )
+
+        # Normalise against the maximum this finding could actually reach.
+        # A fixed denominator is not comparable across scanners: a Trivy
+        # dependency finding can never earn the route exposure bonus and a
+        # Bandit finding can never earn the dependency bonus, so a shared
+        # denominator puts the two scanners on different effective scales.
+        max_score = 4.0 + 2.0 + 2.0 + 1.0  # severity + confidence + cwe + corroboration
+        if context is not None and context.route_path is not None:
+            max_score += 2.0
+        if finding.scanner == "trivy":
+            max_score += 1.0
+
+        score = min(max(raw_score / max_score, 0.0), 1.0)
 
         ranked_severity = _score_to_severity(score)
 
